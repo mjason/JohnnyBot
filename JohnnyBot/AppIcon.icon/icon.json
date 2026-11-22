@@ -1,0 +1,28 @@
+{
+  "fill": {
+    "linear-gradient": [
+      "extended-srgb:0.037,0.063,0.230,1.000",
+      "extended-srgb:0.012,0.025,0.114,1.000"
+    ]
+  },
+  "groups": [
+    {
+      "name": "Terminal bubble",
+      "layers": [
+        {
+          "image-name": "TerminalBubble.png",
+          "name": "Terminal bubble",
+          "glass": false
+        }
+      ],
+      "shadow": {
+        "kind": "layer-color",
+        "opacity": 0.35
+      },
+      "specular": false
+    }
+  ],
+  "supported-platforms": {
+    "squares": "shared"
+  }
+}
