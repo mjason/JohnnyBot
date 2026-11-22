@@ -841,6 +841,14 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 .padding(.vertical, isUser ? 10 : 0)
                 .background(isUser ? Color.accentColor.opacity(0.14) : .clear, in: RoundedRectangle(cornerRadius: 17))
                 .accessibilityLabel(isUser ? "你：\(entry.text)" : entry.text)
+            if let status = entry.toolStatus {
+                Text(status).font(.caption).foregroundStyle(.secondary)
+            }
+            if let output = entry.toolOutput, !output.isEmpty {
+                DisclosureGroup("工具输出") {
+                    Text(output).font(.callout.monospaced()).textSelection(.enabled)
+                }
+            }
         }
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
     }

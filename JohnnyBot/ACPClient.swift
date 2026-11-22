@@ -24,6 +24,8 @@ struct ACPEntry: Identifiable {
     let role: String
     var text: String
     var toolID: String? = nil
+    var toolStatus: String?
+    var toolOutput: String?
 }
 
 struct ACPPermission: Identifiable {
@@ -227,6 +229,9 @@ final class ACPClient {
     func cancelPrompt(in id: String) async throws {
         guard let socket, prompting.contains(id) else { return }
         try await send(["jsonrpc": "2.0", "method": "session/cancel", "params": ["sessionId": id]], to: socket)
+        for permission in permissions.filter({ $0.sessionID == id }) {
+            try await respond(to: permission, option: nil)
+        }
     }
 
     func respond(to permission: ACPPermission, option: String?) async throws {
@@ -348,14 +353,23 @@ final class ACPClient {
             }
         case "tool_call", "tool_call_update":
             guard let toolID = update["toolCallId"] as? String else { return }
-            let status = update["status"] as? String
-            if let index = entries[id]?.firstIndex(where: { $0.toolID == toolID }) {
-                let previous = entries[id]?[index].text ?? toolID
-                let title = update["title"] as? String ?? previous.components(separatedBy: " · ").first ?? toolID
-                entries[id]?[index].text = [title, status].compactMap { $0 }.joined(separator: " · ")
-            } else {
-                let title = update["title"] as? String ?? toolID
-                entries[id, default: []].append(ACPEntry(role: "工具", text: [title, status].compactMap { $0 }.joined(separator: " · "), toolID: toolID))
+            if entries[id]?.contains(where: { $0.toolID == toolID }) != true {
+                entries[id, default: []].append(ACPEntry(role: "工具", text: toolID, toolID: toolID))
+            }
+            guard let index = entries[id]?.firstIndex(where: { $0.toolID == toolID }) else { return }
+            if let title = update["title"] as? String { entries[id]?[index].text = title }
+            if let status = update["status"] as? String { entries[id]?[index].toolStatus = status }
+            if let blocks = update["content"] as? [[String: Any]] {
+                entries[id]?[index].toolOutput = blocks.compactMap { block -> String? in
+                    switch block["type"] as? String {
+                    case "content":
+                        return (block["content"] as? [String: Any])?["text"] as? String
+                    case "diff":
+                        return [block["path"], block["newText"]].compactMap { $0 as? String }.joined(separator: "\n")
+                    default:
+                        return nil
+                    }
+                }.joined(separator: "\n")
             }
         case "plan":
             let steps = (update["entries"] as? [[String: Any]] ?? []).compactMap { step -> String? in
