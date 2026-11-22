@@ -252,7 +252,6 @@ private final class ServerWorkspaceState {
 }
 
 private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
-    @FocusState private var composerFocused: Bool
     let client: ACPClient
     @Bindable var workspace: ServerWorkspaceState
     @Binding var columns: NavigationSplitViewVisibility
@@ -754,56 +753,18 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 }
 
                 if isLoaded {
-                    HStack(spacing: 5) {
-                        TextField("向 Agent 发送消息", text: Binding(
+                    SessionComposer(
+                        draft: Binding(
                             get: { workspace.drafts[id, default: ""] },
                             set: { workspace.drafts[id] = $0 }
-                        ), prompt: Text("向 Agent 发送消息").foregroundStyle(.primary.opacity(0.28)), axis: .vertical)
-                        .focused($composerFocused)
-                        .lineLimit(1...6)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 14, weight: .medium))
-                        .padding(.vertical, 6)
-#if os(macOS)
-                        .onKeyPress(keys: [.return], phases: .down) { key in
-                            let editor = NSApp.keyWindow?.firstResponder as? NSTextView
-                            if editor?.hasMarkedText() == true { return .ignored }
-                            if key.modifiers == .shift, let editor {
-                                editor.insertText("\n", replacementRange: editor.selectedRange())
-                                return .handled
-                            }
-                            guard key.modifiers.isEmpty else { return .ignored }
-                            sendDraft(in: id)
-                            return .handled
-                        }
-#else
-                        .submitLabel(.send)
-                        .onSubmit { sendDraft(in: id) }
-#endif
-                        if isPrompting {
-                            Button { run { try await client.cancelPrompt(in: id) } } label: {
-                                composerIcon("stop.circle")
-                            }
-                            .buttonStyle(ComposerSendStyle())
-                            .accessibilityLabel("停止回复")
-                            .help("停止回复")
-                        } else if !workspace.drafts[id, default: ""].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            Button { sendDraft(in: id) } label: { composerIcon("arrow.up.circle") }
-                                .buttonStyle(ComposerSendStyle())
-                                .accessibilityLabel("发送")
-                                .keyboardShortcut(.return, modifiers: .command)
-                                .help("发送消息（↩），换行（⇧↩）")
-                                .disabled(workspace.managing)
-                        }
-                    }
-                    .padding(.leading, 12)
-                    .padding(.trailing, 5)
-                    .frame(minHeight: 32)
-                    .background { ComposerSurface(focused: composerFocused) }
-                    .frame(maxWidth: 390)
-                    .padding(.horizontal, 20)
-                    .padding(.bottom, 16)
+                        ),
+                        commands: client.sessionOptions[id]?.commands ?? [],
+                        isPrompting: isPrompting,
+                        isManaging: workspace.managing,
+                        send: { sendDraft(in: id) },
+                        stop: { run { try await client.cancelPrompt(in: id) } }
+                    )
+                    .id(id)
                 } else {
                     Button("加载会话") { manage { try await client.load(id) } }
                         .disabled(workspace.managing)
@@ -814,12 +775,15 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         .navigationTitle(session.title)
         .toolbar {
             if isLoaded {
-                Button {
-                    manage { try await client.close(id) }
-                } label: {
-                    Label("释放会话", systemImage: "rectangle.portrait.and.arrow.right")
+                ToolbarItem { sessionSettings(id) }
+                ToolbarItem {
+                    Button {
+                        manage { try await client.close(id) }
+                    } label: {
+                        Label("释放会话", systemImage: "rectangle.portrait.and.arrow.right")
+                    }
+                    .disabled(workspace.managing || isPrompting)
                 }
-                .disabled(workspace.managing || isPrompting)
             }
         }
     }
@@ -831,16 +795,65 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         run { try await client.prompt(text, in: id) }
     }
 
-    private func composerIcon(_ symbol: String) -> some View {
-        Image(systemName: symbol)
-            .font(.system(size: 21, weight: .medium))
-            .foregroundStyle(LinearGradient(
-                colors: [
-                    Color(red: 0.27, green: 0.60, blue: 0.66),
-                    Color(red: 0.74, green: 0.53, blue: 0.34),
-                    Color(red: 0.80, green: 0.47, blue: 0.56)
-                ], startPoint: .leading, endPoint: .trailing))
-            .frame(width: 25, height: 28)
+    @ViewBuilder
+    private func sessionSettings(_ id: String) -> some View {
+        if let options = client.sessionOptions[id] {
+            if let config = options.config {
+                if !config.isEmpty {
+                    Menu {
+                        ForEach(config) { option in
+                            switch option.control {
+                            case let .select(current, groups):
+                                Menu {
+                                    ForEach(groups) { group in
+                                        Section {
+                                            ForEach(group.choices) { choice in
+                                                Button {
+                                                    manage { try await client.setConfigOption(option, value: choice.id, in: id) }
+                                                } label: {
+                                                    if choice.id == current { Label(choice.name, systemImage: "checkmark") }
+                                                    else { Text(choice.name) }
+                                                }
+                                                .help(choice.description ?? choice.name)
+                                            }
+                                        } header: {
+                                            if let name = group.name { Text(name) }
+                                        }
+                                    }
+                                } label: {
+                                    Text("\(option.name) · \(option.currentLabel)")
+                                }
+                                .help(option.description ?? option.name)
+                            case let .boolean(enabled):
+                                Toggle(option.name, isOn: Binding(
+                                    get: { enabled },
+                                    set: { value in manage { try await client.setConfigOption(option, enabled: value, in: id) } }
+                                ))
+                                .help(option.description ?? option.name)
+                            }
+                        }
+                    } label: {
+                        Label("会话设置", systemImage: "slider.horizontal.3")
+                    }
+                    .disabled(workspace.managing)
+                }
+            } else if let modes = options.modes, !modes.availableModes.isEmpty {
+                Menu {
+                    ForEach(modes.availableModes) { mode in
+                        Button {
+                            manage { try await client.setMode(mode.id, in: id) }
+                        } label: {
+                            if mode.id == options.currentModeID { Label(mode.name, systemImage: "checkmark") }
+                            else { Text(mode.name) }
+                        }
+                        .help(mode.description ?? mode.name)
+                    }
+                } label: {
+                    Label("会话模式", systemImage: "slider.horizontal.3")
+                }
+                .disabled(workspace.managing)
+            }
+        }
     }
 
     private func messageRow(_ entry: ACPEntry) -> some View {
@@ -890,49 +903,6 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
 
 #Preview {
     ContentView()
-}
-
-private struct ComposerSendStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label.scaleEffect(configuration.isPressed ? 0.9 : 1)
-    }
-}
-
-private struct ComposerSurface: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.scenePhase) private var scenePhase
-    @Environment(\.colorScheme) private var scheme
-
-    let focused: Bool
-
-    var body: some View {
-        let outline = RoundedRectangle(cornerRadius: 24, style: .continuous)
-        let base = scheme == .dark ? Color(white: 0.14) : .white
-        Group {
-            if focused && scenePhase == .active {
-                TimelineView(.animation(minimumInterval: 1 / 24, paused: reduceMotion)) { frame in
-                    let drift = reduceMotion ? 0 : sin(frame.date.timeIntervalSinceReferenceDate * .pi / 22)
-                    let wash = LinearGradient(stops: [
-                        .init(color: Color(red: 0.53, green: 0.88, blue: 0.94), location: 0),
-                        .init(color: Color(red: 1, green: 0.86, blue: 0.64), location: 0.46 + 0.12 * drift),
-                        .init(color: Color(red: 0.99, green: 0.66, blue: 0.77), location: 1)
-                    ], startPoint: .leading, endPoint: .trailing)
-                    ZStack {
-                        outline.stroke(wash, lineWidth: 6 + drift).blur(radius: 7)
-                        outline.fill(base)
-                        outline.fill(wash.opacity(scheme == .dark ? 0.15 : 0.25))
-                        outline.fill(LinearGradient(colors: [.clear, .purple.opacity(0.05)], startPoint: .top, endPoint: .bottom))
-                        outline.strokeBorder(.white.opacity(scheme == .dark ? 0.55 : 0.96), lineWidth: 1.5)
-                    }
-                }
-            } else {
-                outline.fill(base)
-                    .overlay { outline.strokeBorder(.secondary.opacity(0.25), lineWidth: 1) }
-            }
-        }
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
-    }
 }
 
 #if os(macOS)

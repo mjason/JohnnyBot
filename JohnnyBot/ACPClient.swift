@@ -58,6 +58,7 @@ final class ACPClient {
     private(set) var supportsSessionDelete = false
     private var supportsSessionClose = false
     private(set) var sessions: [ACPSession] = []
+    private(set) var sessionOptions: [String: ACPSessionOptions] = [:]
     private(set) var loaded: Set<String> = []
     private(set) var prompting: Set<String> = []
     private(set) var entries: [String: [ACPEntry]] = [:]
@@ -104,7 +105,10 @@ final class ACPClient {
         task.resume()
         Task { await receive(from: task) }
         do {
-            let info = try await call("initialize", ["protocolVersion": 1, "clientCapabilities": [:]])
+            let info = try await call("initialize", [
+                "protocolVersion": 1,
+                "clientCapabilities": ["session": ["configOptions": ["boolean": [:]]]]
+            ])
             guard info["protocolVersion"] as? Int == 1 else {
                 throw ACPFailure(message: "服务器未协商 ACP v1")
             }
@@ -133,6 +137,7 @@ final class ACPClient {
         for continuation in requests.values {
             continuation.resume(throwing: reason ?? ACPFailure(message: "连接已断开"))
         }
+        sessionOptions.removeAll()
         loaded.removeAll()
         prompting.removeAll()
         permissions.removeAll()
@@ -165,6 +170,7 @@ final class ACPClient {
             throw ACPFailure(message: "服务器未返回会话 ID")
         }
         sessions.insert(ACPSession(id: id, title: "新会话"), at: 0)
+        applySessionSetup(result, to: id)
         loaded.insert(id)
         return id
     }
@@ -173,10 +179,12 @@ final class ACPClient {
         guard !loaded.contains(id) else { return }
         entries[id] = []
         do {
-            _ = try await call("session/load", ["sessionId": id, "mcpServers": []])
+            let result = try await call("session/load", ["sessionId": id, "mcpServers": []])
+            applySessionSetup(result, to: id)
             loaded.insert(id)
         } catch {
             entries.removeValue(forKey: id)
+            sessionOptions.removeValue(forKey: id)
             throw error
         }
     }
@@ -184,6 +192,7 @@ final class ACPClient {
     func close(_ id: String) async throws {
         _ = try await call("session/close", ["sessionId": id])
         loaded.remove(id)
+        sessionOptions.removeValue(forKey: id)
         permissions.removeAll { $0.sessionID == id }
     }
 
@@ -209,9 +218,52 @@ final class ACPClient {
             // The server has already removed this session.
         }
         loaded.remove(id)
+        sessionOptions.removeValue(forKey: id)
         entries.removeValue(forKey: id)
         permissions.removeAll { $0.sessionID == id }
         sessions.removeAll { $0.id == id }
+    }
+
+    func setConfigOption(_ option: ACPConfigOption, value: String, in id: String) async throws {
+        try await setConfigOption(["sessionId": id, "configId": option.id, "value": value], in: id)
+    }
+
+    func setConfigOption(_ option: ACPConfigOption, enabled: Bool, in id: String) async throws {
+        try await setConfigOption([
+            "sessionId": id, "configId": option.id, "type": "boolean", "value": enabled
+        ], in: id)
+    }
+
+    private func setConfigOption(_ params: [String: Any], in id: String) async throws {
+        guard loaded.contains(id) else { return }
+        let result = try await call("session/set_config_option", params)
+        guard let config = result["configOptions"] as? [[String: Any]] else {
+            throw ACPFailure(message: "Agent 未返回完整的会话设置")
+        }
+        if loaded.contains(id) {
+            sessionOptions[id, default: ACPSessionOptions()].config = ACPConfigOption.decode(config)
+        }
+    }
+
+    func setMode(_ modeID: String, in id: String) async throws {
+        guard loaded.contains(id) else { return }
+        let previousMode = sessionOptions[id]?.currentModeID
+        _ = try await call("session/set_mode", ["sessionId": id, "modeId": modeID])
+        if loaded.contains(id), sessionOptions[id]?.currentModeID == previousMode {
+            sessionOptions[id]?.currentModeID = modeID
+        }
+    }
+
+    private func applySessionSetup(_ result: [String: Any], to id: String) {
+        var options = sessionOptions[id, default: ACPSessionOptions()]
+        if options.config == nil, let config = result["configOptions"] as? [[String: Any]] {
+            options.config = ACPConfigOption.decode(config)
+        }
+        if let rawModes = result["modes"], let modes = decodeACP(ACPSessionModes.self, from: rawModes) {
+            options.modes = modes
+            if options.currentModeID == nil { options.currentModeID = modes.currentModeId }
+        }
+        sessionOptions[id] = options
     }
 
     func prompt(_ text: String, in id: String) async throws {
@@ -377,6 +429,18 @@ final class ACPClient {
                 return "\(step["status"] as? String ?? "")  \(content)"
             }
             entries[id, default: []].append(ACPEntry(role: "计划", text: steps.joined(separator: "\n")))
+        case "available_commands_update":
+            guard let commands = update["availableCommands"] as? [[String: Any]] else { return }
+            var names: Set<String> = []
+            sessionOptions[id, default: ACPSessionOptions()].commands = commands
+                .compactMap { decodeACP(ACPCommand.self, from: $0) }
+                .filter { !$0.name.isEmpty && names.insert($0.name).inserted }
+        case "config_option_update":
+            guard let config = update["configOptions"] as? [[String: Any]] else { return }
+            sessionOptions[id, default: ACPSessionOptions()].config = ACPConfigOption.decode(config)
+        case "current_mode_update":
+            guard let mode = update["currentModeId"] as? String else { return }
+            sessionOptions[id, default: ACPSessionOptions()].currentModeID = mode
         case "session_info_update":
             if let title = update["title"] as? String, let index = sessions.firstIndex(where: { $0.id == id }) {
                 sessions[index].title = title
