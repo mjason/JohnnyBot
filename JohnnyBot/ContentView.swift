@@ -245,6 +245,11 @@ struct ContentView: View {
 @Observable @MainActor
 private final class ServerWorkspaceState {
     var selection: String?
+    var sessionLoadFailure: (id: String, error: Error)?
+    var defaultProject: ACPProject?
+    var activeProject: ACPProject?
+    var addedProjects: [ACPProject] = []
+    var expandedProjects: Set<ACPProject> = []
     var drafts: [String: String] = [:]
     var managing = false
     var failure: String?
@@ -259,38 +264,104 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
     @ViewBuilder let header: () -> Header
     @ViewBuilder let trailingAction: () -> TrailingAction
     @State private var importing = false
+    @State private var choosingProject = false
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var sessionToRename: ACPSession?
+    @State private var sessionName = ""
+
+    private var projects: [ACPProject] {
+        guard let initial = workspace.defaultProject else { return [] }
+        return [initial] + workspace.addedProjects.filter { $0 != initial }
+    }
     @State private var hoveredSession: String?
     @State private var sessionToDelete: ACPSession?
 
     var body: some View {
+        workspaceLayout
+        .confirmationDialog(
+            "删除会话？",
+            isPresented: Binding(get: { sessionToDelete != nil }, set: { if !$0 { sessionToDelete = nil } }),
+            titleVisibility: .visible,
+            presenting: sessionToDelete
+        ) { session in
+            Button("删除会话", role: .destructive) {
+                manage {
+                    try await client.deleteSession(session.id)
+                    workspace.drafts.removeValue(forKey: session.id)
+                    if workspace.selection == session.id {
+                        workspace.selection = nil
+                    }
+                }
+            }
+            Button("取消", role: .cancel) {}
+        } message: { session in
+            Text("从服务器的会话列表中删除「\(session.title)」？")
+        }
+        .alert("重命名会话", isPresented: Binding(
+            get: { sessionToRename != nil },
+            set: { if !$0 { sessionToRename = nil } }
+        ), presenting: sessionToRename) { session in
+            TextField("会话名称", text: $sessionName)
+            Button("保存") {
+                let title = sessionName
+                manage { try await client.renameSession(session, to: title) }
+            }
+            .keyboardShortcut(.defaultAction)
+            .disabled(sessionName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            Button("取消", role: .cancel) {}
+        }
+        .task(id: projectsToSync) { await syncProjectTitles() }
+        .sheet(isPresented: $choosingProject) {
+            RemoteDirectoryPicker(client: client, projects: projects, select: addProject)
+        }
+        .onChange(of: workspace.selection, initial: true) { _, id in
+            workspace.sessionLoadFailure = nil
+            if let id, let project = projects.first(where: { client.projectSessionIDs[$0]?.contains(id) == true }) {
+                workspace.activeProject = project
+            }
+            openSelectedSession()
+        }
+        .onChange(of: workspace.managing) { _, managing in
+            if !managing { openSelectedSession() }
+        }
+        .fileImporter(isPresented: $importing, allowedContentTypes: [.data]) { result in
+            do {
+                try client.importToken(from: result.get())
+            } catch {
+                workspace.failure = error.localizedDescription
+            }
+        }
+        .alert("操作失败", isPresented: Binding(get: { workspace.failure != nil }, set: { if !$0 { workspace.failure = nil } })) {
+            Button("确定") { workspace.failure = nil }
+        } message: {
+            Text(workspace.failure ?? "")
+        }
+        .onChange(of: client.connected) { _, connected in
+            if !connected {
+                choosingProject = false
+                sessionToRename = nil
+                workspace.selection = nil
+                workspace.sessionLoadFailure = nil
+                workspace.defaultProject = nil
+                workspace.activeProject = nil
+                workspace.addedProjects.removeAll()
+                workspace.expandedProjects.removeAll()
+                workspace.drafts.removeAll()
+            }
+        }
+    }
+
+    private var workspaceLayout: some View {
         NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $workspace.preferredColumn) {
             List(selection: $workspace.selection) {
-#if os(macOS)
-                if client.sessions.isEmpty {
-                    Section("会话") {
-                        Text(client.connected ? "暂无会话" : "连接服务器后显示会话")
+                Section("项目") {
+                    if projects.isEmpty {
+                        Text(client.connected ? "正在加载项目…" : "连接服务器后显示项目")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }
-                }
-#endif
-                if !client.sessions.isEmpty {
-                    Section("会话") {
-                        ForEach(client.sessions) { session in
-                            Group {
-#if os(macOS)
-                                sessionRow(session).tag(session.id)
-#else
-                                NavigationLink(value: session.id) { sessionRow(session) }
-#endif
-                            }
-                            .contextMenu {
-                                Button("删除会话", systemImage: "trash", role: .destructive) {
-                                    sessionToDelete = session
-                                }
-                                .disabled(!client.supportsSessionDelete || workspace.managing || client.prompting.contains(session.id))
-                            }
-                        }
+                    ForEach(projects) { project in
+                        projectRow(project)
                     }
                 }
             }
@@ -301,14 +372,29 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 if client.connected {
                     HStack {
-                        Button(action: createSession) {
+                        Button {
+                            if let project = workspace.activeProject { createSession(in: project) }
+                        } label: {
                             Label("新建会话", systemImage: "square.and.pencil")
                         }
+                        .help(workspace.activeProject.map { "在「\($0.name)」中创建会话" } ?? "新建会话")
+                        .disabled(workspace.activeProject == nil)
                         Spacer()
-                        Button { manage { try await client.listSessions() } } label: {
-                            Label("刷新会话", systemImage: "arrow.clockwise").labelStyle(.iconOnly)
+                        if client.supportsDirectoryListing {
+                            Button { choosingProject = true } label: {
+                                Label("添加项目", systemImage: "folder.badge.plus").labelStyle(.iconOnly)
+                            }
+                            .help("添加远程项目")
                         }
-                        .help("刷新会话")
+                        if client.supportsSessionList {
+                            Button {
+                                if let project = workspace.activeProject { refresh(project) }
+                            } label: {
+                                Label("刷新会话", systemImage: "arrow.clockwise").labelStyle(.iconOnly)
+                            }
+                            .help("刷新当前项目的会话")
+                            .disabled(workspace.activeProject == nil)
+                        }
                     }
                     .buttonStyle(.borderless)
                     .disabled(workspace.managing)
@@ -332,14 +418,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                     .padding()
                 }
             }
-            .overlay {
-                if client.sessions.isEmpty {
-                    Text(client.connected ? "暂无会话" : "连接后显示会话")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .allowsHitTesting(false)
-                }
-            }
+
 #endif
 #if os(macOS)
             .navigationSplitViewColumnWidth(min: 220, ideal: 268, max: 340)
@@ -364,8 +443,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                         ContentUnavailableView {
                             Label("选择会话", systemImage: "bubble.left.and.bubble.right")
                         } description: {
-                            Text("从边栏选择会话，或新建一段对话。")
-
+                            Text("从边栏展开项目并选择会话，或在项目中创建会话。")
                         }
                     } else {
                         connection
@@ -415,43 +493,6 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
             }
         }
 #endif
-        .confirmationDialog(
-            "删除会话？",
-            isPresented: Binding(get: { sessionToDelete != nil }, set: { if !$0 { sessionToDelete = nil } }),
-            titleVisibility: .visible,
-            presenting: sessionToDelete
-        ) { session in
-            Button("删除会话", role: .destructive) {
-                manage {
-                    try await client.deleteSession(session.id)
-                    workspace.drafts.removeValue(forKey: session.id)
-                    if workspace.selection == session.id {
-                        workspace.selection = nil
-                    }
-                }
-            }
-            Button("取消", role: .cancel) {}
-        } message: { session in
-            Text("从服务器的会话列表中删除「\(session.title)」？")
-        }
-        .fileImporter(isPresented: $importing, allowedContentTypes: [.data]) { result in
-            do {
-                try client.importToken(from: result.get())
-            } catch {
-                workspace.failure = error.localizedDescription
-            }
-        }
-        .alert("操作失败", isPresented: Binding(get: { workspace.failure != nil }, set: { if !$0 { workspace.failure = nil } })) {
-            Button("确定") { workspace.failure = nil }
-        } message: {
-            Text(workspace.failure ?? "")
-        }
-        .onChange(of: client.connected) { _, connected in
-            if !connected {
-                workspace.selection = nil
-                workspace.drafts.removeAll()
-            }
-        }
     }
 
 #if os(macOS)
@@ -519,6 +560,83 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         .keyboardShortcut("s", modifiers: [.command, .control])
     }
 #endif
+
+    private var projectsToSync: Set<ACPProject> {
+        guard client.connected, client.supportsSessionList, scenePhase == .active else { return [] }
+        return Set(projects).intersection(workspace.expandedProjects)
+    }
+
+    private func syncProjectTitles() async {
+        let visibleProjects = projectsToSync
+        guard !visibleProjects.isEmpty else { return }
+        // An Agent may send title updates only to the connection that owns the loaded session.
+        while !Task.isCancelled {
+            do { try await Task.sleep(for: .seconds(15)) }
+            catch { return }
+            for project in visibleProjects {
+                guard !Task.isCancelled, client.connected else { return }
+                if !workspace.managing { try? await client.listSessions(in: project, titlesOnly: true) }
+            }
+        }
+    }
+
+    private func projectRow(_ project: ACPProject) -> some View {
+        DisclosureGroup(isExpanded: Binding(
+            get: { workspace.expandedProjects.contains(project) },
+            set: { expanded in
+                if expanded {
+                    workspace.expandedProjects.insert(project)
+                    workspace.activeProject = project
+                    if client.projectSessionIDs[project] == nil { refresh(project) }
+                } else {
+                    workspace.expandedProjects.remove(project)
+                }
+            }
+        )) {
+            let sessions = client.sessions(in: project)
+            if sessions.isEmpty {
+                Text("暂无会话").font(.callout).foregroundStyle(.secondary)
+            }
+            ForEach(sessions) { session in
+                Group {
+#if os(macOS)
+                    sessionRow(session).tag(session.id)
+#else
+                    NavigationLink(value: session.id) { sessionRow(session) }
+#endif
+                }
+                .contextMenu {
+                    if client.supportsSessionRename {
+                        Button("重命名会话…", systemImage: "pencil") {
+                            sessionName = session.title
+                            sessionToRename = session
+                        }
+                        .disabled(workspace.managing)
+                    }
+                    Button("删除会话", systemImage: "trash", role: .destructive) {
+                        sessionToDelete = session
+                    }
+                    .disabled(!client.supportsSessionDelete || workspace.managing || client.prompting.contains(session.id))
+                }
+            }
+        } label: {
+            Label(project.name, systemImage: workspace.activeProject == project ? "folder.fill" : "folder")
+                .lineLimit(1)
+                .help(project.path ?? "服务器默认项目")
+                .contextMenu {
+                    Button("新建会话", systemImage: "square.and.pencil") { createSession(in: project) }
+                        .disabled(workspace.managing)
+                    if client.supportsSessionList {
+                        Button("刷新会话", systemImage: "arrow.clockwise") { refresh(project) }
+                            .disabled(workspace.managing)
+                    }
+                    if project != workspace.defaultProject {
+                        Button("从侧边栏移除项目", systemImage: "minus.circle") { removeProject(project) }
+                            .disabled(workspace.managing)
+                    }
+                }
+        }
+    }
 
     private func sessionRow(_ session: ACPSession) -> some View {
         let active = client.loaded.contains(session.id)
@@ -664,7 +782,16 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         Button {
             manage {
                 try await client.connect()
-                try await client.listSessions()
+                let defaultPath = client.supportsDirectoryListing ? try? await client.listDirectories().path : nil
+                guard client.connected else { return }
+                let project = ACPProject(path: defaultPath)
+                let saved = UserDefaults.standard.dictionary(forKey: "acpProjectPaths") ?? [:]
+                let paths = saved[client.address] as? [String] ?? []
+                workspace.addedProjects = paths.map { ACPProject(path: $0) }
+                workspace.defaultProject = project
+                workspace.activeProject = project
+                workspace.expandedProjects = [project]
+                try await client.listSessions(in: project)
             }
         } label: {
             Label("连接", systemImage: "arrow.right")
@@ -675,10 +802,62 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                   client.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 
-    private func createSession() {
+    private func refresh(_ project: ACPProject) {
+        manage { try await client.listSessions(in: project) }
+    }
+
+    private func addProject(_ path: String) {
+        let project = ACPProject(path: path)
         manage {
-            workspace.selection = try await client.createSession()
+            try await client.listSessions(in: project)
+            if !projects.contains(project) {
+                workspace.addedProjects.append(project)
+                saveProjects()
+            }
+            workspace.activeProject = project
+            workspace.expandedProjects.insert(project)
+        }
+    }
+
+    private func removeProject(_ project: ACPProject) {
+        workspace.addedProjects.removeAll { $0 == project }
+        workspace.expandedProjects.remove(project)
+        if workspace.activeProject == project { workspace.activeProject = workspace.defaultProject }
+        if let selection = workspace.selection, client.projectSessionIDs[project]?.contains(selection) == true {
+            workspace.selection = nil
+        }
+        saveProjects()
+    }
+
+    private func saveProjects() {
+        var saved = UserDefaults.standard.dictionary(forKey: "acpProjectPaths") ?? [:]
+        saved[client.address] = workspace.addedProjects.compactMap(\.path)
+        UserDefaults.standard.set(saved, forKey: "acpProjectPaths")
+    }
+
+    private func createSession(in project: ACPProject) {
+        manage {
+            let id = try await client.createSession(in: project)
+            workspace.activeProject = project
+            workspace.expandedProjects.insert(project)
+            workspace.selection = id
             workspace.preferredColumn = .detail
+        }
+    }
+
+    private func openSelectedSession() {
+        guard client.connected, client.supportsSessionLoad, let id = workspace.selection,
+              !client.loaded.contains(id), workspace.sessionLoadFailure?.id != id,
+              let session = client.sessions.first(where: { $0.id == id }) else { return }
+        manage {
+            guard client.connected, workspace.selection == id else { return }
+            do {
+                try await client.load(session)
+            } catch {
+                if client.connected, workspace.selection == id {
+                    workspace.sessionLoadFailure = (id, error)
+                }
+            }
         }
     }
 
@@ -688,97 +867,53 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         let isLoaded = client.loaded.contains(id)
         let isPrompting = client.prompting.contains(id)
         let permissions = client.permissions.filter { $0.sessionID == id }
+        let options = client.sessionOptions[id]
+        let showsSettings = options?.config.map { !$0.isEmpty } ?? (options?.modes?.availableModes.isEmpty == false)
+        let horizontalMargin = ConversationLayout.horizontalMargin + (showsSettings ? ConversationLayout.settingsGutter : 0)
         return VStack(spacing: 0) {
-            if !isLoaded && entries.isEmpty {
-                ContentUnavailableView {
-                    Label(session.title, systemImage: "bubble.left")
-                } actions: {
-                    Button("加载会话") { manage { try await client.load(id) } }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(workspace.managing)
+            if isLoaded {
+                SessionTranscript(
+                    entries: entries, isResponding: isPrompting, permissions: permissions,
+                    horizontalMargin: horizontalMargin, composerSpacing: ConversationLayout.composerSpacing
+                ) { permission, option in
+                    run { try await client.respond(to: permission, option: option) }
                 }
-            } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 16) {
-                        ForEach(entries) { entry in
-                            messageRow(entry)
-                        }
-                        Color.clear.frame(height: 1).id("bottom")
-                    }
-                    .frame(maxWidth: 680)
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 22)
-                    .frame(maxWidth: .infinity)
-                }
-#if os(macOS)
-                .scrollEdgeEffectHidden(true, for: .top)
-#endif
-                .defaultScrollAnchor(.bottom)
-                .overlay {
-                    if entries.isEmpty {
-                        ContentUnavailableView("开始对话", systemImage: "text.bubble",
-                                               description: Text("向 Agent 发送一条消息。"))
-                        .allowsHitTesting(false)
-                    }
-                }
+                .id(id)
 
-                ForEach(permissions) { permission in
-                    VStack(alignment: .leading, spacing: 8) {
-                        Label("审批请求", systemImage: "lock.shield")
-                            .font(.headline)
-                        Text(permission.title).textSelection(.enabled)
-                        if let details = permission.details {
-                            DisclosureGroup("工具参数") {
-                                ScrollView {
-                                    Text(details).font(.caption.monospaced()).textSelection(.enabled)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                }
-                                .frame(maxHeight: 120)
-                            }
-                        }
-                        Menu("选择审批结果") {
-                            ForEach(permission.options) { option in
-                                Button(option.name) {
-                                    run { try await client.respond(to: permission, option: option.id) }
-                                }
-                            }
-                            Button("取消请求") { run { try await client.respond(to: permission, option: nil) } }
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(14)
-                    .background(Color.orange.opacity(0.09), in: RoundedRectangle(cornerRadius: 16))
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 5)
-                }
-
-                if isLoaded {
+                ZStack(alignment: .bottomTrailing) {
                     SessionComposer(
                         draft: Binding(
                             get: { workspace.drafts[id, default: ""] },
                             set: { workspace.drafts[id] = $0 }
                         ),
-                        commands: client.sessionOptions[id]?.commands ?? [],
+                        commands: options?.commands ?? [],
                         isPrompting: isPrompting,
                         isManaging: workspace.managing,
+                        horizontalMargin: horizontalMargin,
                         send: { sendDraft(in: id) },
                         stop: { run { try await client.cancelPrompt(in: id) } }
                     )
                     .id(id)
-                } else {
-                    Button("加载会话") { manage { try await client.load(id) } }
-                        .disabled(workspace.managing)
-                        .padding()
+                    .frame(maxWidth: .infinity)
+                    if showsSettings, let options {
+                        sessionSettings(options, in: id)
+                            .padding(.trailing, 20)
+                            .padding(.bottom, 16)
+                    }
                 }
+            } else {
+                sessionOpeningStatus(for: id)
             }
         }
         .navigationTitle(session.title)
         .toolbar {
             if isLoaded {
-                ToolbarItem { sessionSettings(id) }
                 ToolbarItem {
                     Button {
-                        manage { try await client.close(id) }
+                        manage {
+                            try await client.close(id)
+                            if workspace.selection == id { workspace.selection = nil }
+                        }
                     } label: {
                         Label("释放会话", systemImage: "rectangle.portrait.and.arrow.right")
                     }
@@ -788,100 +923,112 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         }
     }
 
-    private func sendDraft(in id: String) {
-        let text = workspace.drafts[id, default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, client.loaded.contains(id), !client.prompting.contains(id), !workspace.managing else { return }
-        workspace.drafts[id] = ""
-        run { try await client.prompt(text, in: id) }
-    }
-
     @ViewBuilder
-    private func sessionSettings(_ id: String) -> some View {
-        if let options = client.sessionOptions[id] {
-            if let config = options.config {
-                if !config.isEmpty {
-                    Menu {
-                        ForEach(config) { option in
-                            switch option.control {
-                            case let .select(current, groups):
-                                Menu {
-                                    ForEach(groups) { group in
-                                        Section {
-                                            ForEach(group.choices) { choice in
-                                                Button {
-                                                    manage { try await client.setConfigOption(option, value: choice.id, in: id) }
-                                                } label: {
-                                                    if choice.id == current { Label(choice.name, systemImage: "checkmark") }
-                                                    else { Text(choice.name) }
-                                                }
-                                                .help(choice.description ?? choice.name)
-                                            }
-                                        } header: {
-                                            if let name = group.name { Text(name) }
-                                        }
-                                    }
-                                } label: {
-                                    Text("\(option.name) · \(option.currentLabel)")
-                                }
-                                .help(option.description ?? option.name)
-                            case let .boolean(enabled):
-                                Toggle(option.name, isOn: Binding(
-                                    get: { enabled },
-                                    set: { value in manage { try await client.setConfigOption(option, enabled: value, in: id) } }
-                                ))
-                                .help(option.description ?? option.name)
-                            }
-                        }
-                    } label: {
-                        Label("会话设置", systemImage: "slider.horizontal.3")
-                    }
-                    .disabled(workspace.managing)
+    private func sessionOpeningStatus(for id: String) -> some View {
+        if !client.supportsSessionLoad {
+            ContentUnavailableView("服务器不支持打开历史会话", systemImage: "bubble.left")
+        } else if let failure = workspace.sessionLoadFailure, failure.id == id {
+            let acpError = failure.error as? ACPFailure
+            let occupied = acpError?.isSessionOccupied == true
+            ContentUnavailableView {
+                if acpError?.isCodexSessionInUse == true {
+                    Label("会话正在 Codex 中使用", systemImage: "person.2")
+                } else {
+                    Label(occupied ? "会话正在其他客户端使用" : "无法打开会话",
+                          systemImage: occupied ? "person.2" : "exclamationmark.circle")
                 }
-            } else if let modes = options.modes, !modes.availableModes.isEmpty {
-                Menu {
-                    ForEach(modes.availableModes) { mode in
-                        Button {
-                            manage { try await client.setMode(mode.id, in: id) }
-                        } label: {
-                            if mode.id == options.currentModeID { Label(mode.name, systemImage: "checkmark") }
-                            else { Text(mode.name) }
-                        }
-                        .help(mode.description ?? mode.name)
-                    }
-                } label: {
-                    Label("会话模式", systemImage: "slider.horizontal.3")
+            } description: {
+                if acpError?.isCodexSessionInUse == true {
+                    Text("请先在远程 Codex 中关闭这条会话，再回到这里重试。")
+                } else {
+                    Text(occupied ? "请在另一客户端释放会话后重试。" : failure.error.localizedDescription)
                 }
+            } actions: {
+                Button("重试") {
+                    workspace.sessionLoadFailure = nil
+                    openSelectedSession()
+                }
+                .buttonStyle(.bordered)
                 .disabled(workspace.managing)
             }
+        } else {
+            ProgressView("正在打开会话…")
+                .controlSize(.small)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
-    private func messageRow(_ entry: ACPEntry) -> some View {
-        let isUser = entry.role == "你"
-        let isAgent = entry.role == "Agent"
-        return VStack(alignment: isUser ? .trailing : .leading, spacing: 6) {
-            if !isUser {
-                Label(entry.role, systemImage: isAgent ? "sparkles" : entry.role == "工具" ? "wrench" : "text.alignleft")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-            }
-            Text(entry.text)
-                .font(isUser || isAgent ? .body : .callout)
-                .textSelection(.enabled)
-                .padding(.horizontal, isUser ? 14 : 0)
-                .padding(.vertical, isUser ? 10 : 0)
-                .background(isUser ? Color.accentColor.opacity(0.14) : .clear, in: RoundedRectangle(cornerRadius: 17))
-                .accessibilityLabel(isUser ? "你：\(entry.text)" : entry.text)
-            if let status = entry.toolStatus {
-                Text(status).font(.caption).foregroundStyle(.secondary)
-            }
-            if let output = entry.toolOutput, !output.isEmpty {
-                DisclosureGroup("工具输出") {
-                    Text(output).font(.callout.monospaced()).textSelection(.enabled)
+    private func sendDraft(in id: String) {
+        let text = workspace.drafts[id, default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
+        let command = ACPCommand.commandText(in: text)
+        guard !text.isEmpty, command != "/", client.loaded.contains(id),
+              !client.prompting.contains(id), !workspace.managing else { return }
+        let invocation = command?.prefix { !$0.isWhitespace } ?? ""
+        let isKnownCommand = client.sessionOptions[id]?.commands.contains { $0.invocation == invocation } == true
+        let prompt = isKnownCommand ? command ?? text : text
+        workspace.drafts[id] = ""
+        run { try await client.prompt(prompt, in: id) }
+    }
+
+    private func sessionSettings(_ options: ACPSessionOptions, in id: String) -> some View {
+        Menu {
+            if let config = options.config {
+                ForEach(config) { option in
+                    switch option.control {
+                    case let .select(current, groups):
+                        Menu {
+                            ForEach(groups) { group in
+                                Section {
+                                    ForEach(group.choices) { choice in
+                                        Button {
+                                            manage { try await client.setConfigOption(option, value: choice.id, in: id) }
+                                        } label: {
+                                            if choice.id == current { Label(choice.name, systemImage: "checkmark") }
+                                            else { Text(choice.name) }
+                                        }
+                                        .help(choice.description ?? choice.name)
+                                    }
+                                } header: {
+                                    if let name = group.name { Text(name) }
+                                }
+                            }
+                        } label: {
+                            Text("\(option.name) · \(option.currentLabel)")
+                        }
+                        .help(option.description ?? option.name)
+                    case let .boolean(enabled):
+                        Toggle(option.name, isOn: Binding(
+                            get: { enabled },
+                            set: { value in manage { try await client.setConfigOption(option, enabled: value, in: id) } }
+                        ))
+                        .help(option.description ?? option.name)
+                    }
+                }
+            } else if let modes = options.modes {
+                ForEach(modes.availableModes) { mode in
+                    Button {
+                        manage { try await client.setMode(mode.id, in: id) }
+                    } label: {
+                        if mode.id == options.currentModeID { Label(mode.name, systemImage: "checkmark") }
+                        else { Text(mode.name) }
+                    }
+                    .help(mode.description ?? mode.name)
                 }
             }
+        } label: {
+            Image(systemName: "slider.horizontal.3")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(.secondary)
         }
-        .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
+#if os(macOS)
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+#endif
+        .frame(width: 32, height: 32)
+        .background(.quaternary.opacity(0.5), in: Circle())
+        .accessibilityLabel("会话设置")
+        .help("切换模型、推理强度和会话模式")
+        .disabled(workspace.managing)
     }
 
     private func manage(_ operation: @escaping @MainActor () async throws -> Void) {

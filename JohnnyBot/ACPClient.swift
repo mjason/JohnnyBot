@@ -4,13 +4,22 @@ import Observation
 struct ACPFailure: LocalizedError {
     let message: String
     let code: Int?
+    private let reason: String?
 
-    init(message: String, code: Int? = nil) {
+    init(message: String, code: Int? = nil, reason: String? = nil) {
         self.message = message
         self.code = code
+        self.reason = reason
     }
 
     var errorDescription: String? { message }
+
+    var isCodexSessionInUse: Bool { reason == "thread_active_writer" }
+
+    var isSessionOccupied: Bool {
+        isCodexSessionInUse
+            || (code == -32010 && message.caseInsensitiveCompare("Session is attached to another client") == .orderedSame)
+    }
 }
 
 struct ACPSession: Identifiable {
@@ -19,13 +28,52 @@ struct ACPSession: Identifiable {
     var cwd = ""
 }
 
+struct ACPProject: Hashable, Identifiable {
+    let path: String?
+    var id: String { path ?? "" }
+
+    var name: String {
+        guard let path else { return "默认项目" }
+        return path.split(separator: "/").last.map(String.init) ?? "/"
+    }
+}
+
+struct ACPDirectoryListing: Decodable {
+    struct Directory: Decodable, Identifiable {
+        let name: String
+        let path: String
+        var id: String { path }
+    }
+
+    let path: String
+    let parent: String?
+    let directories: [Directory]
+}
+
 struct ACPEntry: Identifiable {
+    enum Kind {
+        case user, agent, thought, tool, plan, status
+    }
+
+    enum ToolContent {
+        case text(String)
+        case diff(path: String, oldText: String?, newText: String?)
+        case terminal(String)
+    }
+
+    struct PlanStep: Decodable {
+        let content: String
+        let status: String
+    }
+
     let id = UUID()
-    let role: String
+    let kind: Kind
     var text: String
-    var toolID: String? = nil
+    var toolID: String?
+    var toolKind: String?
     var toolStatus: String?
-    var toolOutput: String?
+    var toolContent: [ToolContent] = []
+    var planSteps: [PlanStep] = []
 }
 
 struct ACPPermission: Identifiable {
@@ -55,9 +103,14 @@ final class ACPClient {
     }
     private(set) var status = "未连接"
     private(set) var connected = false
+    private(set) var supportsSessionLoad = false
+    private(set) var supportsSessionList = false
+    private(set) var supportsDirectoryListing = false
+    private(set) var supportsSessionRename = false
     private(set) var supportsSessionDelete = false
     private var supportsSessionClose = false
     private(set) var sessions: [ACPSession] = []
+    private(set) var projectSessionIDs: [ACPProject: [String]] = [:]
     private(set) var sessionOptions: [String: ACPSessionOptions] = [:]
     private(set) var loaded: Set<String> = []
     private(set) var prompting: Set<String> = []
@@ -67,6 +120,9 @@ final class ACPClient {
     @ObservationIgnored private var socket: URLSessionWebSocketTask?
     @ObservationIgnored private var pending: [Int: CheckedContinuation<[String: Any], Error>] = [:]
     @ObservationIgnored private var nextID = 0
+    @ObservationIgnored private var listingProjects: Set<ACPProject> = []
+    @ObservationIgnored private var titleRevision = 0
+    @ObservationIgnored private var titleUpdates: [String: (title: String, revision: Int)] = [:]
 
     func importToken(from url: URL) throws {
         let accessed = url.startAccessingSecurityScopedResource()
@@ -114,6 +170,12 @@ final class ACPClient {
             }
             let capabilities = info["agentCapabilities"] as? [String: Any]
             let sessionCapabilities = capabilities?["sessionCapabilities"] as? [String: Any]
+            let metadata = capabilities?["_meta"] as? [String: Any]
+            supportsSessionLoad = capabilities?["loadSession"] as? Bool == true
+            supportsDirectoryListing = (metadata?["johnny/list_directories"] as? Bool) == true
+            supportsSessionList = sessionCapabilities?["list"] is [String: Any]
+            supportsSessionRename = sessionCapabilities?["title"] is [String: Any]
+                || sessionCapabilities?["setTitle"] is [String: Any]
             supportsSessionDelete = sessionCapabilities?["delete"] is [String: Any]
             supportsSessionClose = sessionCapabilities?["close"] is [String: Any]
             connected = true
@@ -129,6 +191,10 @@ final class ACPClient {
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         connected = false
+        supportsSessionLoad = false
+        supportsSessionList = false
+        supportsDirectoryListing = false
+        supportsSessionRename = false
         supportsSessionDelete = false
         supportsSessionClose = false
         status = reason.map { "连接中断 · \($0.localizedDescription)" } ?? "未连接"
@@ -142,44 +208,114 @@ final class ACPClient {
         prompting.removeAll()
         permissions.removeAll()
         sessions.removeAll()
+        projectSessionIDs.removeAll()
+        listingProjects.removeAll()
+        titleUpdates.removeAll()
         entries.removeAll()
     }
 
-    func listSessions() async throws {
+    func listDirectories(path: String? = nil) async throws -> ACPDirectoryListing {
+        guard supportsDirectoryListing else {
+            throw ACPFailure(message: "服务器未提供远程目录浏览")
+        }
+        let result = try await call("_johnny/list_directories", path.map { ["path": $0] } ?? [:])
+        guard let listing = decodeACP(ACPDirectoryListing.self, from: result),
+              listing.path.hasPrefix("/"),
+              listing.parent?.hasPrefix("/") != false,
+              listing.directories.allSatisfy({ $0.path.hasPrefix("/") }) else {
+            throw ACPFailure(message: "服务器返回的目录列表格式无效")
+        }
+        return listing
+    }
+
+    func sessions(in project: ACPProject) -> [ACPSession] {
+        let byID = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
+        return projectSessionIDs[project, default: []].compactMap { byID[$0] }
+    }
+
+    func listSessions(in project: ACPProject, titlesOnly: Bool = false) async throws {
+        guard supportsSessionList else { return }
+        guard let socket else { throw ACPFailure(message: "请先连接服务器") }
+        guard listingProjects.insert(project).inserted else { return }
+        defer {
+            if self.socket === socket { listingProjects.remove(project) }
+        }
+
+        let startingRevision = titleRevision
         var listed: [ACPSession] = []
+        var listedIDs: Set<String> = []
         var cursor: String?
         var seenCursors: Set<String> = []
         repeat {
-            let result = try await call("session/list", cursor.map { ["cursor": $0] } ?? [:])
+            var params: [String: Any] = [:]
+            params["cwd"] = project.path
+            params["cursor"] = cursor
+            let result = try await call("session/list", params)
+            guard self.socket === socket else { throw ACPFailure(message: "连接已断开") }
             for item in result["sessions"] as? [[String: Any]] ?? [] {
-                guard let id = item["sessionId"] as? String, !listed.contains(where: { $0.id == id }) else { continue }
-                listed.append(ACPSession(id: id, title: item["title"] as? String ?? "未命名会话", cwd: item["cwd"] as? String ?? ""))
+                let cwd = item["cwd"] as? String ?? project.path ?? ""
+                guard project.path == nil || project.path == cwd,
+                      let id = item["sessionId"] as? String, listedIDs.insert(id).inserted else { continue }
+                let title = item["title"] as? String ?? titleUpdates[id]?.title ?? "未命名会话"
+                listed.append(ACPSession(id: id, title: title, cwd: cwd))
             }
             cursor = result["nextCursor"] as? String
             if let cursor, !cursor.isEmpty, !seenCursors.insert(cursor).inserted {
                 throw ACPFailure(message: "服务器返回重复的分页游标")
             }
         } while cursor?.isEmpty == false
-        let listedIDs = Set(listed.map(\.id))
-        sessions = listed + sessions.filter { loaded.contains($0.id) && !listedIDs.contains($0.id) }
+
+        for index in listed.indices {
+            if let update = titleUpdates[listed[index].id], update.revision > startingRevision {
+                listed[index].title = update.title
+            }
+        }
+        if titlesOnly {
+            let titles = Dictionary(uniqueKeysWithValues: listed.map { ($0.id, $0.title) })
+            for index in sessions.indices {
+                if let title = titles[sessions[index].id], sessions[index].title != title {
+                    sessions[index].title = title
+                }
+            }
+            return
+        }
+
+        let localIDs = projectSessionIDs[project, default: []].filter { loaded.contains($0) && !listedIDs.contains($0) }
+        projectSessionIDs[project] = listed.map(\.id) + localIDs
+        let retained = Set(projectSessionIDs.values.joined()).union(loaded)
+        sessions = listed + sessions.filter { retained.contains($0.id) && !listedIDs.contains($0.id) }
     }
 
-    func createSession() async throws -> String {
-        let result = try await call("session/new", ["mcpServers": []])
+    func createSession(in project: ACPProject) async throws -> String {
+        guard let socket else { throw ACPFailure(message: "请先连接服务器") }
+        var params: [String: Any] = ["mcpServers": []]
+        params["cwd"] = project.path
+        let result = try await call("session/new", params)
+        guard self.socket === socket else { throw ACPFailure(message: "连接已断开") }
         guard let id = result["sessionId"] as? String else {
             throw ACPFailure(message: "服务器未返回会话 ID")
         }
-        sessions.insert(ACPSession(id: id, title: "新会话"), at: 0)
+        let cwd = result["cwd"] as? String ?? project.path ?? ""
+        sessions.removeAll { $0.id == id }
+        let title = titleUpdates[id]?.title ?? result["title"] as? String ?? "新会话"
+        sessions.insert(ACPSession(id: id, title: title, cwd: cwd), at: 0)
+        projectSessionIDs[project, default: []].removeAll { $0 == id }
+        projectSessionIDs[project, default: []].insert(id, at: 0)
         applySessionSetup(result, to: id)
         loaded.insert(id)
         return id
     }
 
-    func load(_ id: String) async throws {
+    func load(_ session: ACPSession) async throws {
+        let id = session.id
         guard !loaded.contains(id) else { return }
+        guard let socket else { throw ACPFailure(message: "请先连接服务器") }
         entries[id] = []
         do {
-            let result = try await call("session/load", ["sessionId": id, "mcpServers": []])
+            var params: [String: Any] = ["sessionId": id, "mcpServers": []]
+            if !session.cwd.isEmpty { params["cwd"] = session.cwd }
+            let result = try await call("session/load", params)
+            guard self.socket === socket else { throw ACPFailure(message: "连接已断开") }
             applySessionSetup(result, to: id)
             loaded.insert(id)
         } catch {
@@ -222,6 +358,49 @@ final class ACPClient {
         entries.removeValue(forKey: id)
         permissions.removeAll { $0.sessionID == id }
         sessions.removeAll { $0.id == id }
+        titleUpdates.removeValue(forKey: id)
+        for project in Array(projectSessionIDs.keys) {
+            projectSessionIDs[project]?.removeAll { $0 == id }
+        }
+    }
+
+    func renameSession(_ session: ACPSession, to draft: String) async throws {
+        guard supportsSessionRename else { throw ACPFailure(message: "服务器不支持重命名会话") }
+        let title = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { throw ACPFailure(message: "会话名称不能为空") }
+
+        do {
+            try await setSessionTitle(title, in: session.id)
+        } catch let error as ACPFailure where error.code == -32010 && !loaded.contains(session.id) {
+            try await load(session)
+            do {
+                try await setSessionTitle(title, in: session.id)
+            } catch {
+                if supportsSessionClose { try? await close(session.id) }
+                throw error
+            }
+            if supportsSessionClose {
+                do { try await close(session.id) }
+                catch { throw ACPFailure(message: "已重命名会话，但无法释放：\(error.localizedDescription)") }
+            }
+        }
+    }
+
+    private func setSessionTitle(_ title: String, in id: String) async throws {
+        guard let socket else { throw ACPFailure(message: "请先连接服务器") }
+        let startingRevision = titleRevision
+        let result = try await call("session/set_title", ["sessionId": id, "title": title])
+        guard self.socket === socket else { throw ACPFailure(message: "连接已断开") }
+        if let update = titleUpdates[id], update.revision > startingRevision { return }
+        updateSessionTitle(result["title"] as? String ?? title, in: id)
+    }
+
+    private func updateSessionTitle(_ title: String, in id: String) {
+        titleRevision += 1
+        titleUpdates[id] = (title, titleRevision)
+        if let index = sessions.firstIndex(where: { $0.id == id }) {
+            sessions[index].title = title
+        }
     }
 
     func setConfigOption(_ option: ACPConfigOption, value: String, in id: String) async throws {
@@ -269,12 +448,12 @@ final class ACPClient {
     func prompt(_ text: String, in id: String) async throws {
         guard loaded.contains(id), prompting.insert(id).inserted else { return }
         defer { prompting.remove(id) }
-        entries[id, default: []].append(ACPEntry(role: "你", text: text))
+        entries[id, default: []].append(ACPEntry(kind: .user, text: text))
         let result = try await call("session/prompt", [
             "sessionId": id, "prompt": [["type": "text", "text": text]]
         ])
         if let reason = result["stopReason"] as? String, reason != "end_turn" {
-            entries[id, default: []].append(ACPEntry(role: "状态", text: reason))
+            entries[id, default: []].append(ACPEntry(kind: .status, text: reason))
         }
     }
 
@@ -345,9 +524,11 @@ final class ACPClient {
                     try await handle(method, message: message, socket: socket)
                 } else if let id = message["id"] as? Int, let continuation = pending.removeValue(forKey: id) {
                     if let error = message["error"] as? [String: Any] {
+                        let data = error["data"] as? [String: Any]
                         continuation.resume(throwing: ACPFailure(
                             message: error["message"] as? String ?? "服务器请求失败",
-                            code: error["code"] as? Int
+                            code: error["code"] as? Int,
+                            reason: data?["reason"] as? String
                         ))
                     } else if let result = message["result"] {
                         continuation.resume(returning: result as? [String: Any] ?? [:])
@@ -397,38 +578,52 @@ final class ACPClient {
         case "agent_message_chunk", "user_message_chunk", "agent_thought_chunk":
             guard let content = update["content"] as? [String: Any] else { return }
             let text = content["text"] as? String ?? "[\(content["type"] as? String ?? "内容")]"
-            let role = kind == "user_message_chunk" ? "你" : kind == "agent_thought_chunk" ? "思考" : "Agent"
-            if let last = entries[id]?.indices.last, entries[id]?[last].role == role, role != "你" {
+            let entryKind: ACPEntry.Kind
+            switch kind {
+            case "user_message_chunk": entryKind = .user
+            case "agent_thought_chunk": entryKind = .thought
+            default: entryKind = .agent
+            }
+            if let last = entries[id]?.indices.last, entries[id]?[last].kind == entryKind, entryKind != .user {
                 entries[id]?[last].text += text
             } else {
-                entries[id, default: []].append(ACPEntry(role: role, text: text))
+                entries[id, default: []].append(ACPEntry(kind: entryKind, text: text))
             }
         case "tool_call", "tool_call_update":
             guard let toolID = update["toolCallId"] as? String else { return }
             if entries[id]?.contains(where: { $0.toolID == toolID }) != true {
-                entries[id, default: []].append(ACPEntry(role: "工具", text: toolID, toolID: toolID))
+                entries[id, default: []].append(ACPEntry(kind: .tool, text: toolID, toolID: toolID))
             }
             guard let index = entries[id]?.firstIndex(where: { $0.toolID == toolID }) else { return }
             if let title = update["title"] as? String { entries[id]?[index].text = title }
+            if let kind = update["kind"] as? String { entries[id]?[index].toolKind = kind }
             if let status = update["status"] as? String { entries[id]?[index].toolStatus = status }
             if let blocks = update["content"] as? [[String: Any]] {
-                entries[id]?[index].toolOutput = blocks.compactMap { block -> String? in
+                entries[id]?[index].toolContent = blocks.compactMap { block in
                     switch block["type"] as? String {
                     case "content":
-                        return (block["content"] as? [String: Any])?["text"] as? String
+                        guard let content = block["content"] as? [String: Any] else { return nil }
+                        return .text(content["text"] as? String ?? "[\(content["type"] as? String ?? "内容")]")
                     case "diff":
-                        return [block["path"], block["newText"]].compactMap { $0 as? String }.joined(separator: "\n")
+                        guard let path = block["path"] as? String else { return nil }
+                        return .diff(path: path, oldText: block["oldText"] as? String, newText: block["newText"] as? String)
+                    case "terminal":
+                        return (block["terminalId"] as? String).map(ACPEntry.ToolContent.terminal)
                     default:
                         return nil
                     }
-                }.joined(separator: "\n")
+                }
             }
         case "plan":
-            let steps = (update["entries"] as? [[String: Any]] ?? []).compactMap { step -> String? in
-                guard let content = step["content"] as? String else { return nil }
-                return "\(step["status"] as? String ?? "")  \(content)"
+            guard let rawSteps = update["entries"] as? [[String: Any]] else { return }
+            let steps = rawSteps.compactMap { decodeACP(ACPEntry.PlanStep.self, from: $0) }
+            let history = entries[id, default: []]
+            let turnStart = (history.lastIndex { $0.kind == .user } ?? -1) + 1
+            if let index = history[turnStart...].lastIndex(where: { $0.kind == .plan }) {
+                entries[id]?[index].planSteps = steps
+            } else if !steps.isEmpty {
+                entries[id, default: []].append(ACPEntry(kind: .plan, text: "", planSteps: steps))
             }
-            entries[id, default: []].append(ACPEntry(role: "计划", text: steps.joined(separator: "\n")))
         case "available_commands_update":
             guard let commands = update["availableCommands"] as? [[String: Any]] else { return }
             var names: Set<String> = []
@@ -442,8 +637,8 @@ final class ACPClient {
             guard let mode = update["currentModeId"] as? String else { return }
             sessionOptions[id, default: ACPSessionOptions()].currentModeID = mode
         case "session_info_update":
-            if let title = update["title"] as? String, let index = sessions.firstIndex(where: { $0.id == id }) {
-                sessions[index].title = title
+            if let title = update["title"] as? String {
+                updateSessionTitle(title, in: id)
             }
         default:
             break

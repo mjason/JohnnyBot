@@ -5,6 +5,7 @@ struct SessionComposer: View {
     let commands: [ACPCommand]
     let isPrompting: Bool
     let isManaging: Bool
+    let horizontalMargin: CGFloat
     let send: () -> Void
     let stop: () -> Void
 
@@ -12,27 +13,43 @@ struct SessionComposer: View {
     @State private var highlighted = 0
     @State private var dismissedQuery: String?
 
+    private var commandQuery: String? {
+        guard focused, draft != dismissedQuery, let query = ACPCommand.commandText(in: draft),
+              !query.contains(where: \.isWhitespace) else { return nil }
+        return query
+    }
+
     private var matches: [ACPCommand] {
-        guard focused, draft != dismissedQuery else { return [] }
-        return ACPCommand.matches(in: draft, commands: commands)
+        guard let commandQuery else { return [] }
+        return ACPCommand.matches(for: commandQuery, commands: commands)
     }
 
     private var argumentHint: String? {
-        guard focused, draft.last?.isWhitespace == true else { return nil }
-        let invocation = draft.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard focused, draft.last?.isWhitespace == true,
+              let command = ACPCommand.commandText(in: draft) else { return nil }
+        let invocation = command.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return commands.first { $0.invocation.lowercased() == invocation }?.input?.hint
     }
 
     var body: some View {
         VStack(spacing: 8) {
-            if !matches.isEmpty {
-                commandList
+            if commandQuery != nil {
+                if matches.isEmpty {
+                    Text(commands.isEmpty ? "Agent 暂未提供命令" : "没有匹配的命令")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                } else {
+                    commandList
+                }
             } else if let hint = argumentHint, !hint.isEmpty {
                 Text(hint)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.leading, 12)
+                    .padding(.leading, 16)
             }
             HStack(spacing: 5) {
                 input
@@ -41,23 +58,42 @@ struct SessionComposer: View {
                         .buttonStyle(ComposerSendStyle())
                         .accessibilityLabel("停止回复")
                         .help("停止回复")
-                } else if !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                } else if !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                          ACPCommand.commandText(in: draft.trimmingCharacters(in: .whitespacesAndNewlines)) != "/" {
                     Button(action: send) { icon("arrow.up.circle") }
                         .buttonStyle(ComposerSendStyle())
                         .accessibilityLabel("发送")
                         .keyboardShortcut(.return, modifiers: .command)
                         .help("发送消息（↩），换行（⇧↩）")
                         .disabled(isManaging)
+                } else {
+                    Button {
+                        dismissedQuery = nil
+                        draft = "/"
+                        focused = true
+                    } label: {
+                        Text("/")
+                            .font(.system(.callout, design: .monospaced).weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 34, height: 36)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("斜杠命令")
+                    .help("查看可用的斜杠命令")
                 }
             }
-            .padding(.leading, 12)
-            .padding(.trailing, 5)
-            .frame(minHeight: 32)
+            .padding(.leading, 16)
+            .padding(.trailing, 8)
+            .frame(minHeight: 48)
             .background { ComposerSurface(focused: focused) }
         }
-        .frame(maxWidth: 390)
-        .padding(.horizontal, 20)
+        .frame(maxWidth: ConversationLayout.maxContentWidth)
+        .padding(.horizontal, horizontalMargin)
         .padding(.bottom, 16)
+#if os(macOS)
+        .onAppear { focused = true }
+#endif
         .onChange(of: draft) { _, newValue in
             highlighted = 0
             if newValue != dismissedQuery { dismissedQuery = nil }
@@ -78,7 +114,7 @@ struct SessionComposer: View {
             .fixedSize(horizontal: false, vertical: true)
             .textFieldStyle(.plain)
             .font(.system(size: 14, weight: .medium))
-            .padding(.vertical, 6)
+            .padding(.vertical, 10)
 #if os(macOS)
             .onKeyPress(keys: [.return, .tab, .upArrow, .downArrow, .escape], phases: .down, action: handleKey)
 #else
@@ -112,8 +148,12 @@ struct SessionComposer: View {
             }
             return .handled
         }
+        if key.key == .escape, commandQuery != nil {
+            dismissedQuery = draft
+            return .handled
+        }
         guard key.key == .return else { return .ignored }
-        send()
+        if commandQuery != "/" { send() }
         return .handled
     }
 #endif
@@ -167,7 +207,7 @@ struct SessionComposer: View {
                     Color(red: 0.74, green: 0.53, blue: 0.34),
                     Color(red: 0.80, green: 0.47, blue: 0.56)
                 ], startPoint: .leading, endPoint: .trailing))
-            .frame(width: 25, height: 28)
+            .frame(width: 34, height: 36)
     }
 }
 

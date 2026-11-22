@@ -11,9 +11,14 @@ struct ACPCommand: Decodable, Identifiable {
     var id: String { name }
     var invocation: String { "/" + name }
 
-    static func matches(in draft: String, commands: [Self]) -> [Self] {
-        guard draft.hasPrefix("/"), !draft.contains(where: \.isWhitespace) else { return [] }
-        return commands.filter { $0.invocation.lowercased().hasPrefix(draft.lowercased()) }
+    static func commandText(in draft: String) -> String? {
+        let text = draft.drop(while: \.isWhitespace)
+        guard let first = text.first, first == "/" || first == "／" else { return nil }
+        return "/" + text.dropFirst()
+    }
+
+    static func matches(for query: String, commands: [Self]) -> [Self] {
+        commands.filter { $0.invocation.lowercased().hasPrefix(query.lowercased()) }
     }
 }
 
