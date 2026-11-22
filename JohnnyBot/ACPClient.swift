@@ -120,7 +120,8 @@ struct ACPPermission: Identifiable {
 
 @MainActor @Observable
 final class ACPClient {
-    static let defaultAddress = "ws://192.168.2.70:8765/acp"
+    static let defaultAddress = ProcessInfo.processInfo.environment["JOHNNY_ACP_URL"]
+        ?? "ws://127.0.0.1:8765/acp"
 
     var address: String
     var token: String
