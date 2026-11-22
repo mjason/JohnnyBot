@@ -50,16 +50,14 @@ struct SessionTranscript: View {
     }
 
     private var messages: some View {
-        ScrollView {
+        let turns = TranscriptTurn.group(entries)
+        return ScrollView {
             LazyVStack(alignment: .leading, spacing: 18) {
-                ForEach(entries) { entry in
-                    TranscriptEntryRow(entry: entry, isStreaming: isResponding && entry.id == entries.last?.id)
-                }
-                if isResponding, entries.last?.kind == .user {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text("等待 Agent 回复").font(.callout).foregroundStyle(.secondary)
-                    }
+                ForEach(turns) { turn in
+                    TranscriptTurnRow(
+                        turn: turn, isLive: isResponding && turn.id == turns.last?.id,
+                        isAwaitingPermission: !permissions.isEmpty
+                    )
                 }
             }
             .frame(maxWidth: ConversationLayout.maxContentWidth)
@@ -80,7 +78,7 @@ struct SessionTranscript: View {
         .scrollEdgeEffectHidden(true, for: .top)
 #endif
         .overlay {
-            if entries.isEmpty {
+            if entries.isEmpty, !isResponding {
                 ContentUnavailableView("开始对话", systemImage: "text.bubble",
                                        description: Text("向 Agent 发送一条消息。"))
                     .allowsHitTesting(false)
@@ -106,9 +104,174 @@ struct SessionTranscript: View {
     }
 }
 
+struct TranscriptTurn: Identifiable {
+    let id: UUID
+    let user: ACPEntry?
+    let entries: ArraySlice<ACPEntry>
+
+    private init?(user: ACPEntry?, entries: ArraySlice<ACPEntry>) {
+        guard let id = user?.id ?? entries.first?.id else { return nil }
+        self.id = id
+        self.user = user
+        self.entries = entries
+    }
+
+    static func group(_ entries: [ACPEntry]) -> [Self] {
+        var turns: [Self] = []
+        var user: ACPEntry?
+        var start = entries.startIndex
+
+        for index in entries.indices where entries[index].kind == .user {
+            if let turn = Self(user: user, entries: entries[start..<index]) { turns.append(turn) }
+            user = entries[index]
+            start = index + 1
+        }
+        if let turn = Self(user: user, entries: entries[start...]) { turns.append(turn) }
+        return turns
+    }
+
+    var replyTiming: ACPReplyTiming? {
+        entries.reversed().lazy.compactMap(\.replyTiming).first ?? user?.replyTiming
+    }
+
+    var responseStart: Int {
+        guard let lastWork = entries.lastIndex(where: {
+            $0.kind == .tool || $0.kind == .thought || $0.kind == .plan || $0.phase == .commentary
+        }) else { return entries.startIndex }
+
+        if let finalAnswer = entries.firstIndex(where: { $0.phase == .finalAnswer }) {
+            return finalAnswer
+        }
+
+        let afterWork = entries.index(after: lastWork)
+        return entries[afterWork...].lastIndex(where: { $0.kind == .agent }) ?? afterWork
+    }
+}
+
+private struct TranscriptTurnRow: View {
+    let turn: TranscriptTurn
+    let isLive: Bool
+    let isAwaitingPermission: Bool
+
+    @State private var expansionOverride: Bool?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        let responseStart = turn.responseStart
+        let isExpanded = expansionOverride ?? isLive
+        let hasCancelStatus = turn.entries.last?.kind == .status
+            && ["cancelled", "canceled"].contains(turn.entries.last?.text ?? "")
+        let summary = (isLive ? nil : turn.replyTiming).map { timing in
+            let elapsed = timing.elapsed.formatted(
+                .units(allowed: [.hours, .minutes, .seconds], width: .abbreviated).locale(Locale(identifier: "zh-Hans"))
+            )
+            return timing.wasStopped ? "在 \(elapsed) 后停止" : "用时 \(elapsed)"
+        }
+        let response = turn.entries[responseStart...]
+        VStack(alignment: .leading, spacing: 14) {
+            if let user = turn.user {
+                TranscriptEntryRow(entry: user, isStreaming: false)
+            }
+            if responseStart > turn.entries.startIndex {
+                VStack(alignment: .leading, spacing: 10) {
+                    workToggle(summary: summary, isExpanded: isExpanded)
+                    if isExpanded {
+                        VStack(alignment: .leading, spacing: 12) {
+                            blocks(turn.entries[..<responseStart], showAgentLabel: false)
+                        }
+                    }
+                }
+            } else if let summary {
+                Text(summary)
+                    .font(.callout)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            blocks(hasCancelStatus && summary != nil ? response.dropLast() : response)
+            if isLive {
+                TranscriptActivity(entries: turn.entries, isAwaitingPermission: isAwaitingPermission)
+            }
+        }
+    }
+
+    private func workToggle(summary: String?, isExpanded: Bool) -> some View {
+        Button {
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
+                expansionOverride = !isExpanded
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Text(summary ?? "工作过程")
+                    .monospacedDigit()
+                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .accessibilityHidden(true)
+            }
+            .font(.callout.weight(.medium))
+#if os(macOS)
+            .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+#else
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+#endif
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .accessibilityLabel(summary.map { "工作过程，\($0)" } ?? "工作过程")
+        .accessibilityValue(isExpanded ? "已展开" : "已收起")
+    }
+
+    private func blocks(_ entries: ArraySlice<ACPEntry>, showAgentLabel: Bool = true) -> some View {
+        ForEach(TranscriptBlock.group(entries)) { block in
+            switch block {
+            case .message(let entry):
+                TranscriptEntryRow(entry: entry, isStreaming: isLive && turn.entries.last?.id == entry.id,
+                                   showAgentLabel: showAgentLabel)
+            case .tools(_, let calls):
+                TranscriptToolGroup(calls: calls, isLive: isLive)
+            }
+        }
+    }
+}
+
+private enum TranscriptBlock: Identifiable {
+    case message(ACPEntry)
+    case tools(UUID, [ACPEntry])
+
+    var id: UUID {
+        switch self {
+        case .message(let entry): entry.id
+        case .tools(let id, _): id
+        }
+    }
+
+    static func group(_ entries: ArraySlice<ACPEntry>) -> [Self] {
+        var blocks: [Self] = []
+        var tools: [ACPEntry] = []
+
+        func flushTools() {
+            guard let first = tools.first else { return }
+            blocks.append(.tools(first.id, tools))
+            tools = []
+        }
+
+        for entry in entries {
+            if entry.kind == .tool {
+                tools.append(entry)
+            } else {
+                flushTools()
+                blocks.append(.message(entry))
+            }
+        }
+        flushTools()
+        return blocks
+    }
+}
+
 private struct TranscriptEntryRow: View {
     let entry: ACPEntry
     let isStreaming: Bool
+    var showAgentLabel = true
 
     @ScaledMetric(relativeTo: .body) private var textSize = ConversationLayout.transcriptTextSize
 
@@ -118,9 +281,11 @@ private struct TranscriptEntryRow: View {
             userMessage
         case .agent:
             VStack(alignment: .leading, spacing: 7) {
-                Label("Agent", systemImage: "sparkles")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                if showAgentLabel {
+                    Label("Agent", systemImage: "sparkles")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
                 TranscriptMarkdown(text: entry.text, isStreaming: isStreaming)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -137,7 +302,7 @@ private struct TranscriptEntryRow: View {
                 .modifier(TranscriptPanel())
             }
         case .tool:
-            toolRow
+            EmptyView()
         case .plan:
             if !entry.planSteps.isEmpty {
                 VStack(alignment: .leading, spacing: 9) {
@@ -163,90 +328,24 @@ private struct TranscriptEntryRow: View {
         let bubble = RoundedRectangle(cornerRadius: 15)
         return HStack(alignment: .top, spacing: 0) {
             Spacer(minLength: 44)
-            Text(entry.text)
-                .font(.system(size: textSize))
-                .lineSpacing(3)
-                .textSelection(.enabled)
-                .padding(.horizontal, 13)
-                .padding(.vertical, 9)
-                .background(.primary.opacity(0.045), in: bubble)
-                .overlay { bubble.strokeBorder(.primary.opacity(0.075)).allowsHitTesting(false) }
-                .accessibilityLabel("你：\(entry.text)")
-                .frame(maxWidth: 470, alignment: .trailing)
-        }
-    }
-
-    @ViewBuilder private var toolRow: some View {
-        if entry.toolContent.isEmpty {
-            toolLabel
-                .modifier(TranscriptPanel())
-        } else {
-            DisclosureGroup {
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(Array(entry.toolContent.enumerated()), id: \.offset) { _, content in
-                        switch content {
-                        case let .text(text):
-                            output(text)
-                        case let .diff(path, oldText, newText):
-                            VStack(alignment: .leading, spacing: 6) {
-                                Label(path, systemImage: "doc.text")
-                                    .font(.caption.monospaced())
-                                    .textSelection(.enabled)
-                                if let oldText {
-                                    DisclosureGroup("修改前") { output(oldText) }
-                                }
-                                if let newText {
-                                    DisclosureGroup("修改后") { output(newText) }
-                                }
-                            }
-                        case let .terminal(id):
-                            Label("终端 \(id)", systemImage: "terminal")
-                                .font(.callout.monospaced())
-                                .textSelection(.enabled)
-                        }
-                    }
+            VStack(alignment: .trailing, spacing: 6) {
+                ForEach(entry.attachments) { attachment in
+                    AttachmentBadge(preview: attachment)
                 }
-                .padding(.top, 6)
-            } label: {
-                toolLabel
+                if !entry.text.isEmpty {
+                    Text(entry.text)
+                        .font(.system(size: textSize))
+                        .lineSpacing(3)
+                        .textSelection(.enabled)
+                        .padding(.horizontal, 13)
+                        .padding(.vertical, 9)
+                        .background(.primary.opacity(0.045), in: bubble)
+                        .overlay { bubble.strokeBorder(.primary.opacity(0.075)).allowsHitTesting(false) }
+                        .accessibilityLabel("你：\(entry.text)")
+                }
             }
-            .modifier(TranscriptPanel())
+            .frame(maxWidth: 470, alignment: .trailing)
         }
-    }
-
-    private var toolLabel: some View {
-        HStack(spacing: 8) {
-            Label(entry.text, systemImage: toolSymbol)
-                .font(.callout.weight(.medium))
-                .lineLimit(2)
-            Spacer(minLength: 8)
-            if let status = entry.toolStatus {
-                let presentation = TranscriptStatus(status)
-                Label(presentation.label, systemImage: presentation.symbol)
-                    .font(.caption)
-                    .foregroundStyle(presentation.tint)
-            }
-        }
-    }
-
-    private var toolSymbol: String {
-        switch entry.toolKind {
-        case "read": "doc.text"
-        case "edit": "square.and.pencil"
-        case "search": "magnifyingglass"
-        case "execute": "terminal"
-        case "fetch": "network"
-        default: "wrench"
-        }
-    }
-
-    private func output(_ text: String) -> some View {
-        Text(text)
-            .font(.callout.monospaced())
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(8)
-            .background(.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
     }
 }
 
@@ -438,7 +537,7 @@ private struct TranscriptPanel: ViewModifier {
     }
 }
 
-private struct TranscriptStatus {
+struct TranscriptStatus {
     let value: String
 
     init(_ value: String) { self.value = value }

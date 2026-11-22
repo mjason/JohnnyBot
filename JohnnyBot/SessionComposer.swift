@@ -1,17 +1,40 @@
 import SwiftUI
+import UniformTypeIdentifiers
+#if os(iOS)
+import PhotosUI
+#endif
 
 struct SessionComposer: View {
     @Binding var draft: String
+    let attachments: [ACPAttachment]
+    let supportsImages: Bool
+    let supportsFiles: Bool
     let commands: [ACPCommand]
     let isPrompting: Bool
     let isManaging: Bool
     let horizontalMargin: CGFloat
     let send: () -> Void
     let stop: () -> Void
+    let addAttachments: ([ACPAttachment]) -> Void
+    let removeAttachment: (UUID) -> Void
+    let attachmentFailed: (Error) -> Void
 
     @FocusState private var focused: Bool
     @State private var highlighted = 0
     @State private var dismissedQuery: String?
+    @State private var choosingFiles = false
+    @State private var targetingDrop = false
+#if os(iOS)
+    @State private var choosingPhoto = false
+    @State private var photo: PhotosPickerItem?
+#endif
+
+    private var canAttach: Bool { supportsImages || supportsFiles }
+
+    private var canSend: Bool {
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (!text.isEmpty || !attachments.isEmpty) && ACPCommand.commandText(in: text) != "/"
+    }
 
     private var commandQuery: String? {
         guard focused, draft != dismissedQuery, let query = ACPCommand.commandText(in: draft),
@@ -51,48 +74,59 @@ struct SessionComposer: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.leading, 16)
             }
-            HStack(spacing: 5) {
-                input
-                if isPrompting {
-                    Button(action: stop) { icon("stop.circle") }
-                        .buttonStyle(ComposerSendStyle())
-                        .accessibilityLabel("停止回复")
-                        .help("停止回复")
-                } else if !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                          ACPCommand.commandText(in: draft.trimmingCharacters(in: .whitespacesAndNewlines)) != "/" {
-                    Button(action: send) { icon("arrow.up.circle") }
-                        .buttonStyle(ComposerSendStyle())
-                        .accessibilityLabel("发送")
-                        .keyboardShortcut(.return, modifiers: .command)
-                        .help("发送消息（↩），换行（⇧↩）")
-                        .disabled(isManaging)
-                } else {
-                    Button {
-                        dismissedQuery = nil
-                        draft = "/"
-                        focused = true
-                    } label: {
-                        Text("/")
-                            .font(.system(.callout, design: .monospaced).weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 34, height: 36)
-                            .contentShape(Rectangle())
+            VStack(alignment: .leading, spacing: 0) {
+                if !attachments.isEmpty {
+                    ScrollView(.horizontal) {
+                        HStack(spacing: 8) {
+                            ForEach(attachments) { attachment in
+                                AttachmentBadge(preview: attachment.preview) { removeAttachment(attachment.id) }
+                            }
+                        }
+                        .padding(.vertical, 2)
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("斜杠命令")
-                    .help("查看可用的斜杠命令")
+                    .scrollIndicators(.hidden)
+                    .padding(.top, 9)
+                    .padding(.horizontal, 11)
+                }
+                composerRow
+            }
+            .background { ComposerSurface(focused: focused) }
+            .overlay {
+                if targetingDrop {
+                    RoundedRectangle(cornerRadius: 24).strokeBorder(Color.accentColor.opacity(0.7), lineWidth: 2)
+                        .allowsHitTesting(false)
                 }
             }
-            .padding(.leading, 16)
-            .padding(.trailing, 8)
-            .frame(minHeight: 48)
-            .background { ComposerSurface(focused: focused) }
+            .onDrop(of: [.fileURL, .image], isTargeted: $targetingDrop) { providers in
+                guard canAttach else { return false }
+                addProviders(providers)
+                return true
+            }
         }
         .frame(maxWidth: ConversationLayout.maxContentWidth)
         .padding(.horizontal, horizontalMargin)
         .padding(.bottom, 16)
+        .fileImporter(isPresented: $choosingFiles, allowedContentTypes: supportsFiles ? [.item] : [.image],
+                      allowsMultipleSelection: true) { result in
+            switch result {
+            case .success(let urls): importFiles(urls)
+            case .failure(let error): attachmentFailed(error)
+            }
+        }
 #if os(macOS)
         .onAppear { focused = true }
+#else
+        .photosPicker(isPresented: $choosingPhoto, selection: $photo, matching: .images)
+        .onChange(of: photo) { _, item in
+            guard let item else { return }
+            photo = nil
+            Task {
+                do {
+                    guard let data = try await item.loadTransferable(type: Data.self) else { throw AttachmentError.invalidImage }
+                    importImage(data, name: "照片")
+                } catch { attachmentFailed(error) }
+            }
+        }
 #endif
         .onChange(of: draft) { _, newValue in
             highlighted = 0
@@ -106,6 +140,85 @@ struct SessionComposer: View {
         }
     }
 
+    private var composerRow: some View {
+        HStack(spacing: 5) {
+            if canAttach { attachmentMenu }
+            input
+            if isPrompting {
+                Button(action: stop) { icon("stop.circle") }
+                    .buttonStyle(ComposerSendStyle())
+                    .accessibilityLabel("停止回复")
+                    .help("停止回复")
+            } else if canSend {
+                Button(action: send) { icon("arrow.up.circle") }
+                    .buttonStyle(ComposerSendStyle())
+                    .accessibilityLabel("发送")
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .help("发送消息（↩），换行（⇧↩）")
+                    .disabled(isManaging)
+            } else {
+                Button {
+                    dismissedQuery = nil
+                    draft = "/"
+                    focused = true
+                } label: {
+                    Text("/")
+                        .font(.system(.callout, design: .monospaced).weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 34, height: 36)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("斜杠命令")
+                .help("查看可用的斜杠命令")
+            }
+        }
+        .padding(.leading, canAttach ? 8 : 16)
+        .padding(.trailing, 8)
+        .frame(minHeight: 48)
+    }
+
+    private var attachmentMenu: some View {
+        Menu {
+            Button { choosingFiles = true } label: {
+                Label(supportsFiles ? "添加文件…" : "添加图片…", systemImage: "paperclip")
+            }
+            if supportsImages {
+#if os(macOS)
+                Button {
+                    ComposerScreenshot.shared.take { result in
+                        switch result {
+                        case .success(let attachment):
+                            if let attachment { addAttachments([attachment]) }
+                        case .failure(let error): attachmentFailed(error)
+                        }
+                    }
+                } label: { Label("截取窗口或屏幕…", systemImage: "camera.viewfinder") }
+#else
+                Button { choosingPhoto = true } label: { Label("从照片添加…", systemImage: "photo") }
+#endif
+            }
+#if os(macOS)
+            Button { _ = pasteAttachment() } label: {
+                Label("粘贴附件", systemImage: "document.on.clipboard")
+            }
+#endif
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 30, height: 32)
+                .contentShape(Rectangle())
+        }
+#if os(macOS)
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .frame(width: 30)
+#endif
+        .accessibilityLabel("添加附件")
+        .help("添加截图、图片或文件")
+    }
+
     private var input: some View {
         TextField("向 Agent 发送消息", text: $draft,
                   prompt: Text("向 Agent 发送消息").foregroundStyle(.primary.opacity(0.28)), axis: .vertical)
@@ -116,7 +229,7 @@ struct SessionComposer: View {
             .font(.system(size: 14, weight: .medium))
             .padding(.vertical, 10)
 #if os(macOS)
-            .onKeyPress(keys: [.return, .tab, .upArrow, .downArrow, .escape], phases: .down, action: handleKey)
+            .onKeyPress(keys: [.return, .tab, .upArrow, .downArrow, .escape, "v"], phases: .down, action: handleKey)
 #else
             .submitLabel(.send)
             .onSubmit { send() }
@@ -127,6 +240,7 @@ struct SessionComposer: View {
     private func handleKey(_ key: KeyPress) -> KeyPress.Result {
         let editor = NSApp.keyWindow?.firstResponder as? NSTextView
         if editor?.hasMarkedText() == true { return .ignored }
+        if key.key == "v", key.modifiers == .command, pasteAttachment() { return .handled }
         if key.key == .return, key.modifiers == .shift, let editor {
             editor.insertText("\n", replacementRange: editor.selectedRange())
             return .handled
@@ -156,7 +270,63 @@ struct SessionComposer: View {
         if commandQuery != "/" { send() }
         return .handled
     }
+
+    private func pasteAttachment() -> Bool {
+        guard canAttach else { return false }
+        let pasteboard = NSPasteboard.general
+        let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        if !urls.isEmpty {
+            importFiles(urls)
+            return true
+        }
+        guard let type = pasteboard.availableType(from: [.png, .tiff]), let data = pasteboard.data(forType: type) else { return false }
+        importImage(data, name: "粘贴的图片")
+        return true
+    }
 #endif
+
+    private func importFiles(_ urls: [URL]) {
+        Task {
+            for url in urls {
+                do {
+                    let attachment = try await Task.detached { try ACPAttachment.file(at: url) }.value
+                    addAttachments([attachment])
+                } catch { attachmentFailed(error) }
+            }
+        }
+    }
+
+    private func importImage(_ data: Data, name: String) {
+        guard supportsImages else { attachmentFailed(AttachmentError.unsupportedImage); return }
+        Task {
+            do {
+                let attachment = try await Task.detached { try ACPAttachment.image(data, name: name) }.value
+                addAttachments([attachment])
+            } catch { attachmentFailed(error) }
+        }
+    }
+
+    private func addProviders(_ providers: [NSItemProvider]) {
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier) { item, error in
+                    let url = (item as? URL) ?? (item as? Data).flatMap { URL(dataRepresentation: $0, relativeTo: nil) }
+                    Task { @MainActor in
+                        if let url, url.isFileURL { importFiles([url]) }
+                        else { attachmentFailed(error ?? AttachmentError.fileRequired) }
+                    }
+                }
+            } else if let type = provider.registeredTypeIdentifiers.first(where: { UTType($0)?.conforms(to: .image) == true }) {
+                let name = provider.suggestedName ?? "图片"
+                provider.loadDataRepresentation(forTypeIdentifier: type) { data, error in
+                    Task { @MainActor in
+                        if let data { importImage(data, name: name) }
+                        else { attachmentFailed(error ?? AttachmentError.invalidImage) }
+                    }
+                }
+            }
+        }
+    }
 
     private var commandList: some View {
         ScrollViewReader { proxy in

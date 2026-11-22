@@ -251,6 +251,7 @@ private final class ServerWorkspaceState {
     var addedProjects: [ACPProject] = []
     var expandedProjects: Set<ACPProject> = []
     var drafts: [String: String] = [:]
+    var draftAttachments: [String: [ACPAttachment]] = [:]
     var managing = false
     var failure: String?
     var preferredColumn: NavigationSplitViewColumn = .detail
@@ -288,6 +289,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 manage {
                     try await client.deleteSession(session.id)
                     workspace.drafts.removeValue(forKey: session.id)
+                    workspace.draftAttachments.removeValue(forKey: session.id)
                     if workspace.selection == session.id {
                         workspace.selection = nil
                     }
@@ -346,7 +348,6 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 workspace.activeProject = nil
                 workspace.addedProjects.removeAll()
                 workspace.expandedProjects.removeAll()
-                workspace.drafts.removeAll()
             }
         }
     }
@@ -581,7 +582,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
     }
 
     private func projectRow(_ project: ACPProject) -> some View {
-        DisclosureGroup(isExpanded: Binding(
+        let isExpanded = Binding(
             get: { workspace.expandedProjects.contains(project) },
             set: { expanded in
                 if expanded {
@@ -592,7 +593,8 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                     workspace.expandedProjects.remove(project)
                 }
             }
-        )) {
+        )
+        return DisclosureGroup(isExpanded: isExpanded) {
             let sessions = client.sessions(in: project)
             if sessions.isEmpty {
                 Text("暂无会话").font(.callout).foregroundStyle(.secondary)
@@ -622,6 +624,11 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         } label: {
             Label(project.name, systemImage: workspace.activeProject == project ? "folder.fill" : "folder")
                 .lineLimit(1)
+#if os(macOS)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2) { isExpanded.wrappedValue.toggle() }
+#endif
                 .help(project.path ?? "服务器默认项目")
                 .contextMenu {
                     Button("新建会话", systemImage: "square.and.pencil") { createSession(in: project) }
@@ -886,12 +893,18 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                             get: { workspace.drafts[id, default: ""] },
                             set: { workspace.drafts[id] = $0 }
                         ),
+                        attachments: workspace.draftAttachments[id, default: []],
+                        supportsImages: client.supportsPromptImages,
+                        supportsFiles: client.supportsPromptFiles,
                         commands: options?.commands ?? [],
                         isPrompting: isPrompting,
                         isManaging: workspace.managing,
                         horizontalMargin: horizontalMargin,
                         send: { sendDraft(in: id) },
-                        stop: { run { try await client.cancelPrompt(in: id) } }
+                        stop: { run { try await client.cancelPrompt(in: id) } },
+                        addAttachments: { addAttachments($0, in: id) },
+                        removeAttachment: { attachment in workspace.draftAttachments[id]?.removeAll { $0.id == attachment } },
+                        attachmentFailed: { workspace.failure = $0.localizedDescription }
                     )
                     .id(id)
                     .frame(maxWidth: .infinity)
@@ -959,15 +972,47 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
     }
 
     private func sendDraft(in id: String) {
-        let text = workspace.drafts[id, default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
+        let draft = workspace.drafts[id, default: ""]
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let attachments = workspace.draftAttachments[id, default: []]
         let command = ACPCommand.commandText(in: text)
-        guard !text.isEmpty, command != "/", client.loaded.contains(id),
+        guard !text.isEmpty || !attachments.isEmpty, command != "/", client.loaded.contains(id),
               !client.prompting.contains(id), !workspace.managing else { return }
         let invocation = command?.prefix { !$0.isWhitespace } ?? ""
         let isKnownCommand = client.sessionOptions[id]?.commands.contains { $0.invocation == invocation } == true
         let prompt = isKnownCommand ? command ?? text : text
         workspace.drafts[id] = ""
-        run { try await client.prompt(prompt, in: id) }
+        workspace.draftAttachments[id] = []
+        run {
+            do {
+                try await client.prompt(prompt, attachments: attachments, in: id)
+            } catch {
+                let nextDraft = workspace.drafts[id, default: ""]
+                workspace.drafts[id] = [draft, nextDraft].filter { !$0.isEmpty }.joined(separator: "\n\n")
+                workspace.draftAttachments[id, default: []].insert(contentsOf: attachments, at: 0)
+                throw error
+            }
+        }
+    }
+
+    private func addAttachments(_ attachments: [ACPAttachment], in id: String) {
+        guard client.loaded.contains(id), !attachments.isEmpty else { return }
+        var pending = workspace.draftAttachments[id, default: []]
+        var byteCount = pending.reduce(0) { $0 + $1.byteCount }
+        for attachment in attachments {
+            let isImage = attachment.preview.isImage
+            guard isImage ? client.supportsPromptImages : client.supportsPromptFiles else {
+                workspace.failure = (isImage ? AttachmentError.unsupportedImage : AttachmentError.unsupportedFile).localizedDescription
+                continue
+            }
+            guard byteCount + attachment.byteCount <= ACPAttachment.maxTotalBytes else {
+                workspace.failure = AttachmentError.messageTooLarge.localizedDescription
+                continue
+            }
+            pending.append(attachment)
+            byteCount += attachment.byteCount
+        }
+        workspace.draftAttachments[id] = pending
     }
 
     private func sessionSettings(_ options: ACPSessionOptions, in id: String) -> some View {
