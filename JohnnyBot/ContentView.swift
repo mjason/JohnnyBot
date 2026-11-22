@@ -711,6 +711,9 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                     .padding(.vertical, 22)
                     .frame(maxWidth: .infinity)
                 }
+#if os(macOS)
+                .scrollEdgeEffectHidden(true, for: .top)
+#endif
                 .defaultScrollAnchor(.bottom)
                 .overlay {
                     if entries.isEmpty {
