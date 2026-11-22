@@ -73,9 +73,10 @@ struct SessionTranscript: View {
         } action: { _, awayFromBottom in
             showsJumpToLatest = awayFromBottom
         }
-        .scrollEdgeEffectHidden(true, for: .bottom)
 #if os(macOS)
-        .scrollEdgeEffectHidden(true, for: .top)
+        .scrollEdgeEffectHidden(true, for: [.top, .bottom])
+#else
+        .scrollEdgeEffectHidden(true, for: .bottom)
 #endif
         .overlay {
             if entries.isEmpty, !isResponding {

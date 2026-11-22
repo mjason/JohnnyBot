@@ -267,6 +267,12 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
     @State private var importing = false
     @State private var choosingProject = false
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(RemoteTerminalWindows.self) private var terminalWindows
+#if os(macOS)
+    @Environment(\.openWindow) private var openWindow
+#else
+    @State private var terminalSession: RemoteTerminalWindows.Session?
+#endif
     @State private var sessionToRename: ACPSession?
     @State private var sessionName = ""
 
@@ -316,6 +322,11 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         .sheet(isPresented: $choosingProject) {
             RemoteDirectoryPicker(client: client, projects: projects, select: addProject)
         }
+#if !os(macOS)
+        .sheet(item: $terminalSession) { session in
+            RemoteTerminalWindow(session: session)
+        }
+#endif
         .onChange(of: workspace.selection, initial: true) { _, id in
             workspace.sessionLoadFailure = nil
             if let id, let project = projects.first(where: { client.projectSessionIDs[$0]?.contains(id) == true }) {
@@ -323,6 +334,13 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
             }
             openSelectedSession()
         }
+#if os(macOS)
+        .onChange(of: workspace.activeProject, initial: true) { _, project in
+            guard terminalWindows.isPresented, client.supportsRemoteShell, let project else { return }
+            do { try terminalWindows.select(client, project: project) }
+            catch { workspace.failure = error.localizedDescription }
+        }
+#endif
         .onChange(of: workspace.managing) { _, managing in
             if !managing { openSelectedSession() }
         }
@@ -449,6 +467,14 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                     } else {
                         connection
                     }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .overlay(alignment: .bottomTrailing) {
+                if client.supportsRemoteShell, let project = workspace.activeProject {
+                    terminalButton(project)
+                        .padding(.trailing, 14)
+                        .padding(.bottom, 16)
                 }
             }
 #if os(macOS)
@@ -627,7 +653,14 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
 #if os(macOS)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
-                .onTapGesture(count: 2) { isExpanded.wrappedValue.toggle() }
+                .gesture(TapGesture(count: 2).exclusively(before: TapGesture()).onEnded { tap in
+                    workspace.activeProject = project
+                    if let currentSession = workspace.selection,
+                       client.projectSessionIDs[project]?.contains(currentSession) != true {
+                        workspace.selection = nil
+                    }
+                    if case .first = tap { isExpanded.wrappedValue.toggle() }
+                })
 #endif
                 .help(project.path ?? "服务器默认项目")
                 .contextMenu {
@@ -876,7 +909,9 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         let permissions = client.permissions.filter { $0.sessionID == id }
         let options = client.sessionOptions[id]
         let showsSettings = options?.config.map { !$0.isEmpty } ?? (options?.modes?.availableModes.isEmpty == false)
-        let horizontalMargin = ConversationLayout.horizontalMargin + (showsSettings ? ConversationLayout.settingsGutter : 0)
+        let settingsMargin = showsSettings ? ConversationLayout.settingsGutter : 0
+        let terminalMargin: CGFloat = client.supportsRemoteShell ? 46 : 0
+        let horizontalMargin = ConversationLayout.horizontalMargin + settingsMargin + terminalMargin
         return VStack(spacing: 0) {
             if isLoaded {
                 SessionTranscript(
@@ -910,7 +945,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                     .frame(maxWidth: .infinity)
                     if showsSettings, let options {
                         sessionSettings(options, in: id)
-                            .padding(.trailing, 20)
+                            .padding(.trailing, 20 + terminalMargin)
                             .padding(.bottom, 16)
                     }
                 }
@@ -934,6 +969,30 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 }
             }
         }
+    }
+
+    private func terminalButton(_ project: ACPProject) -> some View {
+        Button {
+            do {
+#if os(macOS)
+                try terminalWindows.select(client, project: project)
+                openWindow(id: "remote-terminal")
+#else
+                terminalSession = try terminalWindows.session(for: client, project: project)
+#endif
+            } catch {
+                workspace.failure = error.localizedDescription
+            }
+        } label: {
+            Label("远程终端", systemImage: "terminal")
+                .labelStyle(.iconOnly)
+                .font(.system(size: 15, weight: .medium))
+                .frame(width: 24, height: 24)
+        }
+        .buttonStyle(.bordered)
+        .buttonBorderShape(.circle)
+        .controlSize(.large)
+        .help("打开远程终端")
     }
 
     @ViewBuilder
@@ -1095,6 +1154,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
 
 #Preview {
     ContentView()
+        .environment(RemoteTerminalWindows())
 }
 
 #if os(macOS)

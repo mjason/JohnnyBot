@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		9EB8AE3D2F70000000A00001 /* SwiftStreamingMarkdown in Frameworks */ = {isa = PBXBuildFile; productRef = 9EB8AE3D2F70000000A00003 /* SwiftStreamingMarkdown */; };
+		9EB8AE3D2F70000000A00004 /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = 9EB8AE3D2F70000000A00006 /* SwiftTerm */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -57,6 +58,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				9EB8AE3D2F70000000A00001 /* SwiftStreamingMarkdown in Frameworks */,
+				9EB8AE3D2F70000000A00004 /* SwiftTerm in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -110,6 +112,7 @@
 			name = JohnnyBot;
 			packageProductDependencies = (
 				9EB8AE3D2F70000000A00003 /* SwiftStreamingMarkdown */,
+				9EB8AE3D2F70000000A00006 /* SwiftTerm */,
 			);
 			productName = JohnnyBot;
 			productReference = 2D5B3E1D30B2A290005338F4 /* JohnnyBot.app */;
@@ -195,6 +198,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				9EB8AE3D2F70000000A00002 /* XCLocalSwiftPackageReference "ThirdParty/SwiftStreamingMarkdown" */,
+				9EB8AE3D2F70000000A00005 /* XCRemoteSwiftPackageReference "SwiftTerm" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 2D5B3DE430B29907005338F4;
@@ -618,11 +622,27 @@
 		};
 /* End XCLocalSwiftPackageReference section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+		9EB8AE3D2F70000000A00005 /* XCRemoteSwiftPackageReference "SwiftTerm" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/migueldeicaza/SwiftTerm";
+			requirement = {
+				kind = exactVersion;
+				version = 1.99.3;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
 		9EB8AE3D2F70000000A00003 /* SwiftStreamingMarkdown */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = 9EB8AE3D2F70000000A00002 /* XCLocalSwiftPackageReference "ThirdParty/SwiftStreamingMarkdown" */;
 			productName = SwiftStreamingMarkdown;
+		};
+		9EB8AE3D2F70000000A00006 /* SwiftTerm */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 9EB8AE3D2F70000000A00005 /* XCRemoteSwiftPackageReference "SwiftTerm" */;
+			productName = SwiftTerm;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

@@ -134,6 +134,7 @@ final class ACPClient {
     private(set) var supportsSessionLoad = false
     private(set) var supportsSessionList = false
     private(set) var supportsDirectoryListing = false
+    private(set) var supportsRemoteShell = false
     private(set) var supportsSessionRename = false
     private(set) var supportsSessionDelete = false
     private(set) var supportsPromptImages = false
@@ -180,12 +181,7 @@ final class ACPClient {
         guard let url = URL(string: address), let scheme = url.scheme, ["ws", "wss"].contains(scheme), url.host != nil else {
             throw ACPFailure(message: "请输入有效的 WebSocket 地址")
         }
-        let credential = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !credential.isEmpty, !credential.contains(where: \.isNewline) else {
-            throw ACPFailure(message: "请输入有效的令牌")
-        }
-        var request = URLRequest(url: url, timeoutInterval: 15)
-        request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization")
+        let request = try authorizedRequest(to: url)
         let task = URLSession.shared.webSocketTask(with: request)
         task.maximumMessageSize = 16 * 1024 * 1024
         socket = task
@@ -204,6 +200,7 @@ final class ACPClient {
             let sessionCapabilities = capabilities?["sessionCapabilities"] as? [String: Any]
             let promptCapabilities = capabilities?["promptCapabilities"] as? [String: Any]
             let metadata = capabilities?["_meta"] as? [String: Any]
+            supportsRemoteShell = metadata?["johnny/shell"] as? Bool == true
             supportsPromptImages = promptCapabilities?["image"] as? Bool == true
             supportsPromptFiles = promptCapabilities?["embeddedContext"] as? Bool == true
             supportsSessionLoad = capabilities?["loadSession"] as? Bool == true
@@ -222,6 +219,28 @@ final class ACPClient {
         }
     }
 
+    func shellRequest() throws -> URLRequest {
+        guard connected, supportsRemoteShell, let endpoint = socket?.originalRequest?.url,
+              var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
+            throw ACPFailure(message: "当前服务器没有提供远程终端")
+        }
+        components.path = endpoint.deletingLastPathComponent().appending(path: "shell").path
+        components.query = nil
+        components.fragment = nil
+        guard let url = components.url else { throw ACPFailure(message: "无法解析终端地址") }
+        return try authorizedRequest(to: url)
+    }
+
+    private func authorizedRequest(to url: URL) throws -> URLRequest {
+        let credential = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !credential.isEmpty, !credential.contains(where: \.isNewline) else {
+            throw ACPFailure(message: "请输入有效的令牌")
+        }
+        var request = URLRequest(url: url, timeoutInterval: 15)
+        request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization")
+        return request
+    }
+
     func disconnect(reason: Error? = nil) {
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
@@ -229,6 +248,7 @@ final class ACPClient {
         supportsSessionLoad = false
         supportsSessionList = false
         supportsDirectoryListing = false
+        supportsRemoteShell = false
         supportsSessionRename = false
         supportsSessionDelete = false
         supportsPromptImages = false
