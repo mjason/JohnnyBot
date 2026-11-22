@@ -761,41 +761,40 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                         ), prompt: Text("向 Agent 发送消息").foregroundStyle(.primary.opacity(0.28)), axis: .vertical)
                         .focused($composerFocused)
                         .lineLimit(1...6)
+                        .fixedSize(horizontal: false, vertical: true)
                         .textFieldStyle(.plain)
                         .font(.system(size: 14, weight: .medium))
-                        .tint(.primary)
                         .padding(.vertical, 6)
+#if os(macOS)
+                        .onKeyPress(keys: [.return], phases: .down) { key in
+                            let editor = NSApp.keyWindow?.firstResponder as? NSTextView
+                            if editor?.hasMarkedText() == true { return .ignored }
+                            if key.modifiers == .shift, let editor {
+                                editor.insertText("\n", replacementRange: editor.selectedRange())
+                                return .handled
+                            }
+                            guard key.modifiers.isEmpty else { return .ignored }
+                            sendDraft(in: id)
+                            return .handled
+                        }
+#else
+                        .submitLabel(.send)
+                        .onSubmit { sendDraft(in: id) }
+#endif
                         if isPrompting {
                             Button { run { try await client.cancelPrompt(in: id) } } label: {
-                                Label("停止", systemImage: "stop.fill").labelStyle(.iconOnly)
-                            }
-                            .buttonStyle(.bordered)
-                            .buttonBorderShape(.circle)
-                            .help("停止回复")
-                        } else if !workspace.drafts[id, default: ""].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            Button {
-                                let text = workspace.drafts[id, default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
-                                guard !text.isEmpty else { return }
-                                workspace.drafts[id] = ""
-                                run { try await client.prompt(text, in: id) }
-                            } label: {
-                                Image(systemName: "arrow.up.circle")
-                                    .font(.system(size: 21, weight: .medium))
-                                    .foregroundStyle(LinearGradient(
-                                        colors: [
-                                            Color(red: 0.27, green: 0.60, blue: 0.66),
-                                            Color(red: 0.74, green: 0.53, blue: 0.34),
-                                            Color(red: 0.80, green: 0.47, blue: 0.56)
-                                        ],
-                                        startPoint: .leading,
-                                        endPoint: .trailing))
-                                    .frame(width: 25, height: 28)
+                                composerIcon("stop.circle")
                             }
                             .buttonStyle(ComposerSendStyle())
-                            .accessibilityLabel("发送")
-                            .keyboardShortcut(.return, modifiers: .command)
-                            .help("发送消息（⌘↩）")
-                            .disabled(workspace.drafts[id, default: ""].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || workspace.managing)
+                            .accessibilityLabel("停止回复")
+                            .help("停止回复")
+                        } else if !workspace.drafts[id, default: ""].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Button { sendDraft(in: id) } label: { composerIcon("arrow.up.circle") }
+                                .buttonStyle(ComposerSendStyle())
+                                .accessibilityLabel("发送")
+                                .keyboardShortcut(.return, modifiers: .command)
+                                .help("发送消息（↩），换行（⇧↩）")
+                                .disabled(workspace.managing)
                         }
                     }
                     .padding(.leading, 12)
@@ -823,6 +822,25 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 .disabled(workspace.managing || isPrompting)
             }
         }
+    }
+
+    private func sendDraft(in id: String) {
+        let text = workspace.drafts[id, default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, client.loaded.contains(id), !client.prompting.contains(id), !workspace.managing else { return }
+        workspace.drafts[id] = ""
+        run { try await client.prompt(text, in: id) }
+    }
+
+    private func composerIcon(_ symbol: String) -> some View {
+        Image(systemName: symbol)
+            .font(.system(size: 21, weight: .medium))
+            .foregroundStyle(LinearGradient(
+                colors: [
+                    Color(red: 0.27, green: 0.60, blue: 0.66),
+                    Color(red: 0.74, green: 0.53, blue: 0.34),
+                    Color(red: 0.80, green: 0.47, blue: 0.56)
+                ], startPoint: .leading, endPoint: .trailing))
+            .frame(width: 25, height: 28)
     }
 
     private func messageRow(_ entry: ACPEntry) -> some View {
