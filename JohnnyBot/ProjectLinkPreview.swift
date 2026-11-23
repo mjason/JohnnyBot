@@ -33,7 +33,9 @@ private struct ProjectReference: Identifiable {
 struct ProjectLinkPreview: ViewModifier {
     let client: ACPClient
     let session: String
+#if !os(macOS)
     @State private var reference: ProjectReference?
+#endif
 
     func body(content: Content) -> some View {
         content
@@ -42,16 +44,51 @@ struct ProjectLinkPreview: ViewModifier {
                     return .systemAction
                 }
                 guard let file = ProjectReference(url) else { return .discarded }
+#if os(macOS)
+                ProjectFileWindow.open(file, client: client, session: session)
+#else
                 reference = file
+#endif
                 return .handled
             })
+#if !os(macOS)
             .sheet(item: $reference) { file in
-                ProjectFileSheet(file: file, client: client, session: session)
+                ProjectFilePreview(file: file, client: client, session: session)
             }
+#endif
     }
 }
 
-private struct ProjectFileSheet: View {
+#if os(macOS)
+@MainActor
+private final class ProjectFileWindow: NSWindowController, NSWindowDelegate {
+    private static var openWindows: [UUID: ProjectFileWindow] = [:]
+    private let id = UUID()
+
+    static func open(_ file: ProjectReference, client: ACPClient, session: String) {
+        let preview = ProjectFilePreview(file: file, client: client, session: session)
+            .background(ResizableWindowTitlebar())
+        let window = NSWindow(contentViewController: NSHostingController(rootView: preview))
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        window.collectionBehavior.insert(.fullScreenPrimary)
+        window.title = (file.path as NSString).lastPathComponent
+        window.subtitle = file.path
+        window.setContentSize(NSSize(width: 780, height: 540))
+        window.center()
+        let controller = ProjectFileWindow(window: window)
+        openWindows[controller.id] = controller
+        window.delegate = controller
+        controller.showWindow(nil)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        Self.openWindows.removeValue(forKey: id)
+    }
+}
+#endif
+
+private struct ProjectFilePreview: View {
     let file: ProjectReference
     let client: ACPClient
     let session: String
@@ -76,6 +113,7 @@ private struct ProjectFileSheet: View {
 
     var body: some View {
         VStack(spacing: 0) {
+#if !os(macOS)
             HStack {
                 VStack(alignment: .leading) {
                     Text((file.path as NSString).lastPathComponent).font(.headline)
@@ -85,6 +123,7 @@ private struct ProjectFileSheet: View {
                 Button("完成") { dismiss() }.keyboardShortcut(.cancelAction)
             }.padding()
             Divider()
+#endif
             if let source {
                 ReadOnlyEditor(editor: CodeEditor(text: .constant(source), position: $position,
                                                   messages: .constant([]), language: language)
@@ -96,7 +135,7 @@ private struct ProjectFileSheet: View {
             }
         }
 #if os(macOS)
-        .frame(minWidth: 560, idealWidth: 780, minHeight: 380, idealHeight: 540)
+        .frame(minWidth: 560, maxWidth: .infinity, minHeight: 380, maxHeight: .infinity)
 #endif
         .task {
             do {

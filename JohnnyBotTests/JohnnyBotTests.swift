@@ -10,6 +10,7 @@ import Testing
 @testable import JohnnyBot
 #if os(macOS)
 import AppKit
+import SwiftUI
 #endif
 
 @MainActor
@@ -91,6 +92,40 @@ struct JohnnyBotTests {
     }
 
 #if os(macOS)
+    @Test func projectFileLinkOpensIndependentResizableWindow() async throws {
+        struct FileLink: View {
+            @Environment(\.openURL) var openURL
+            let url: URL
+            var body: some View { Color.clear.onAppear { openURL(url) } }
+        }
+
+        let url = URL(filePath: "/remote/preview-\(UUID()).swift")
+        let link = FileLink(url: url).modifier(ProjectLinkPreview(
+            client: ACPClient(address: "", token: ""), session: "preview"
+        ))
+        let parent = NSWindow(contentViewController: NSHostingController(rootView: link))
+        parent.orderBack(nil)
+        defer { parent.orderOut(nil) }
+        for _ in 0..<100 {
+            if NSApp.windows.contains(where: { $0.title == url.lastPathComponent }) { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let editor = try #require(NSApp.windows.first { $0.title == url.lastPathComponent })
+        defer { editor.close() }
+        #expect(editor.sheetParent == nil)
+        #expect(editor.collectionBehavior.contains(.fullScreenPrimary))
+        for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            let button = try #require(editor.standardWindowButton(kind))
+            #expect(button.isEnabled && !button.isHidden)
+        }
+        editor.miniaturize(nil)
+        for _ in 0..<100 where !editor.isMiniaturized { try await Task.sleep(for: .milliseconds(20)) }
+        #expect(editor.isMiniaturized)
+        editor.deminiaturize(nil)
+        for _ in 0..<100 where editor.isMiniaturized { try await Task.sleep(for: .milliseconds(20)) }
+        #expect(!editor.isMiniaturized)
+    }
+
     @Test func mainWindowKeepsItsSeparatorHiddenAfterToolbarChanges() async throws {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
                               styleMask: [.titled, .resizable], backing: .buffered, defer: false)

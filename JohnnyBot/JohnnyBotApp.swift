@@ -33,7 +33,7 @@ struct JohnnyBotApp: App {
             .onAppear { terminals.isPresented = true }
             .onDisappear { terminals.isPresented = false }
             .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
-            .background(TerminalTitlebar())
+            .background(ResizableWindowTitlebar())
         }
         .defaultSize(width: 780, height: 470)
         .defaultLaunchBehavior(.suppressed)
@@ -84,7 +84,7 @@ final class MainWindowTitlebarView: NSView {
     }
 }
 
-private struct TerminalTitlebar: NSViewRepresentable {
+struct ResizableWindowTitlebar: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView { DragView() }
     func updateNSView(_ nsView: NSView, context: Context) {}
 
