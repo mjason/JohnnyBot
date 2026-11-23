@@ -10,6 +10,7 @@
 		9EB8AE3D2F70000000A00001 /* SwiftStreamingMarkdown in Frameworks */ = {isa = PBXBuildFile; productRef = 9EB8AE3D2F70000000A00003 /* SwiftStreamingMarkdown */; };
 		9EB8AE3D2F70000000A00004 /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = 9EB8AE3D2F70000000A00006 /* SwiftTerm */; };
 		9EB8AE3D2F70000000A00007 /* JohnnyBotUpdater in Frameworks */ = {isa = PBXBuildFile; productRef = 9EB8AE3D2F70000000A00009 /* JohnnyBotUpdater */; };
+		9EB8AE3D2F70000000B00104 /* CodeEditorView in Frameworks */ = {isa = PBXBuildFile; productRef = 9EB8AE3D2F70000000B00106 /* CodeEditorView */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -60,6 +61,7 @@
 			files = (
 				9EB8AE3D2F70000000A00001 /* SwiftStreamingMarkdown in Frameworks */,
 				9EB8AE3D2F70000000A00004 /* SwiftTerm in Frameworks */,
+				9EB8AE3D2F70000000B00104 /* CodeEditorView in Frameworks */,
 				9EB8AE3D2F70000000A00007 /* JohnnyBotUpdater in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -115,6 +117,7 @@
 			packageProductDependencies = (
 				9EB8AE3D2F70000000A00003 /* SwiftStreamingMarkdown */,
 				9EB8AE3D2F70000000A00006 /* SwiftTerm */,
+				9EB8AE3D2F70000000B00106 /* CodeEditorView */,
 				9EB8AE3D2F70000000A00009 /* JohnnyBotUpdater */,
 			);
 			productName = JohnnyBot;
@@ -202,6 +205,7 @@
 			packageReferences = (
 				9EB8AE3D2F70000000A00002 /* XCLocalSwiftPackageReference "ThirdParty/SwiftStreamingMarkdown" */,
 				9EB8AE3D2F70000000A00005 /* XCRemoteSwiftPackageReference "SwiftTerm" */,
+				9EB8AE3D2F70000000B00105 /* XCRemoteSwiftPackageReference "CodeEditorView" */,
 				9EB8AE3D2F70000000A00008 /* XCLocalSwiftPackageReference "Packages/JohnnyBotUpdater" */,
 			);
 			preferredProjectObjectVersion = 77;
@@ -641,6 +645,14 @@
 				version = 1.99.3;
 			};
 		};
+		9EB8AE3D2F70000000B00105 /* XCRemoteSwiftPackageReference "CodeEditorView" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/mchakravarty/CodeEditorView";
+			requirement = {
+				kind = exactVersion;
+				version = 0.16.0;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -658,6 +670,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 9EB8AE3D2F70000000A00008 /* XCLocalSwiftPackageReference "Packages/JohnnyBotUpdater" */;
 			productName = JohnnyBotUpdater;
+		};
+		9EB8AE3D2F70000000B00106 /* CodeEditorView */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 9EB8AE3D2F70000000B00105 /* XCRemoteSwiftPackageReference "CodeEditorView" */;
+			productName = CodeEditorView;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

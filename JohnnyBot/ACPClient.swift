@@ -120,6 +120,26 @@ struct ACPPermission: Identifiable {
 
 @MainActor @Observable
 final class ACPClient {
+    @ObservationIgnored private var streamUpdates: [(String, [String: Any])] = []
+    @ObservationIgnored private var streamFlush: Task<Void, Never>?
+    @ObservationIgnored private var peerTurns = Set<String>()
+
+    private func flushStream() {
+        streamFlush?.cancel()
+        streamFlush = nil
+        for (session, update) in streamUpdates { apply(update, to: session) }
+        streamUpdates.removeAll(keepingCapacity: true)
+    }
+
+    private func enqueueStream(_ update: [String: Any], session: String) {
+        streamUpdates.append((session, update))
+        guard streamFlush == nil else { return }
+        streamFlush = Task {
+            do { try await Task.sleep(for: .milliseconds(120)) } catch { return }
+            flushStream()
+        }
+    }
+
     private struct TranscriptIndex {
         struct Message: Hashable {
             let kind: ACPEntry.Kind
@@ -144,6 +164,7 @@ final class ACPClient {
     private(set) var connected = false
     private(set) var supportsSessionLoad = false
     private(set) var supportsSessionList = false
+    private var supportsProjectFilePreview = false
     private(set) var supportsDirectoryListing = false
     private var serverHomeDirectory: String?
     private(set) var supportsRemoteShell = false
@@ -218,6 +239,7 @@ final class ACPClient {
             supportsPromptImages = promptCapabilities?["image"] as? Bool == true
             supportsPromptFiles = promptCapabilities?["embeddedContext"] as? Bool == true
             supportsSessionLoad = capabilities?["loadSession"] as? Bool == true
+            supportsProjectFilePreview = metadata?["johnny/read_project_file"] as? Bool == true
             supportsDirectoryListing = (metadata?["johnny/list_directories"] as? Bool) == true
             if let home = metadata?["johnny/home_directory"] as? String, home.hasPrefix("/") {
                 serverHomeDirectory = home
@@ -259,11 +281,16 @@ final class ACPClient {
     }
 
     func disconnect(reason: Error? = nil) {
+        streamFlush?.cancel()
+        streamFlush = nil
+        streamUpdates.removeAll()
+        peerTurns.removeAll()
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         connected = false
         supportsSessionLoad = false
         supportsSessionList = false
+        supportsProjectFilePreview = false
         supportsDirectoryListing = false
         serverHomeDirectory = nil
         supportsRemoteShell = false
@@ -305,6 +332,13 @@ final class ACPClient {
         default:
             return nil
         }
+    }
+
+    func readProjectFile(_ path: String, session: String) async throws -> String {
+        guard supportsProjectFilePreview else { throw ACPFailure(message: "请更新服务器以启用项目文件预览") }
+        let result = try await call("_johnny/read_project_file", ["sessionId": session, "path": path])
+        guard let content = result["content"] as? String else { throw ACPFailure(message: "服务器返回的文件内容无效") }
+        return content
     }
 
     func listDirectories(path: String? = nil) async throws -> ACPDirectoryListing {
@@ -583,12 +617,22 @@ final class ACPClient {
         let startedAt = ContinuousClock.now
         let userEntry = ACPEntry(kind: .user, text: text, attachments: attachments.map(\.preview))
         entries[id, default: []].append(userEntry)
-        defer { if self.socket === socket { prompting.remove(id) } }
+        defer { if self.socket === socket && !peerTurns.contains(id) { prompting.remove(id) } }
         let result: [String: Any]
         do {
             result = try await call("session/prompt", ["sessionId": id, "prompt": blocks])
         } catch {
-            if self.socket === socket, entries[id]?.last?.id == userEntry.id { entries[id]?.removeLast() }
+            if self.socket === socket,
+               entries[id]?.last?.id == userEntry.id || (error as? ACPFailure)?.code == -32010,
+               let offset = entries[id]?.firstIndex(where: { $0.id == userEntry.id }) {
+                entries[id]?.remove(at: offset)
+                // Removing an optimistic entry shifts indexes for later messages.
+                transcriptIndexes[id] = TranscriptIndex()
+                for (index, entry) in (entries[id] ?? []).enumerated() {
+                    if let key = entry.messageID { transcriptIndexes[id]?.messages[.init(kind: entry.kind, id: key)] = index }
+                    if let key = entry.toolID { transcriptIndexes[id]?.tools[key] = index }
+                }
+            }
             throw error
         }
         guard self.socket === socket else { return }
@@ -675,6 +719,7 @@ final class ACPClient {
                 if let method = message["method"] as? String {
                     try await handle(method, message: message, socket: socket)
                 } else if let id = message["id"] as? Int, let continuation = pending.removeValue(forKey: id) {
+                    flushStream()
                     if let error = message["error"] as? [String: Any] {
                         let data = error["data"] as? [String: Any]
                         continuation.resume(throwing: ACPFailure(
@@ -707,6 +752,14 @@ final class ACPClient {
     private func handle(_ method: String, message: [String: Any], socket: URLSessionWebSocketTask) async throws {
         let params = message["params"] as? [String: Any] ?? [:]
         let sessionID = params["sessionId"] as? String
+        if method == "session/update", let sessionID, replayHistory[sessionID] == nil,
+           let update = params["update"] as? [String: Any],
+           let kind = update["sessionUpdate"] as? String,
+           kind == "agent_message_chunk" || kind == "agent_thought_chunk" {
+            enqueueStream(update, session: sessionID)
+            return
+        }
+        flushStream()
         if let id = message["id"] {
             if method == "session/request_permission", let sessionID,
                let tool = params["toolCall"] as? [String: Any],
@@ -729,7 +782,13 @@ final class ACPClient {
                     "code": code, "message": code == -32602 ? "Invalid params" : "Method not found"
                 ]], to: socket)
             }
+        } else if method == "$/cancel_request", let request = params["requestId"] as? NSObject {
+            permissions.removeAll { request.isEqual($0.requestID) }
+        } else if method == "_johnny/prompt_started", let sessionID {
+            peerTurns.insert(sessionID)
+            prompting.insert(sessionID)
         } else if method == "_johnny/prompt_finished", let sessionID {
+            peerTurns.remove(sessionID)
             prompting.remove(sessionID)
             permissions.removeAll { $0.sessionID == sessionID }
             let reason = params["stopReason"] as? String

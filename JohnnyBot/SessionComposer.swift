@@ -388,7 +388,6 @@ private struct ComposerSendStyle: ButtonStyle {
 }
 
 private struct ComposerSurface: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.colorScheme) private var scheme
 
@@ -399,20 +398,17 @@ private struct ComposerSurface: View {
         let base = scheme == .dark ? Color(white: 0.14) : .white
         Group {
             if focused && scenePhase == .active {
-                TimelineView(.animation(minimumInterval: 1 / 24, paused: reduceMotion)) { frame in
-                    let drift = reduceMotion ? 0 : sin(frame.date.timeIntervalSinceReferenceDate * .pi / 22)
-                    let wash = LinearGradient(stops: [
-                        .init(color: Color(red: 0.53, green: 0.88, blue: 0.94), location: 0),
-                        .init(color: Color(red: 1, green: 0.86, blue: 0.64), location: 0.46 + 0.12 * drift),
-                        .init(color: Color(red: 0.99, green: 0.66, blue: 0.77), location: 1)
-                    ], startPoint: .leading, endPoint: .trailing)
-                    ZStack {
-                        outline.stroke(wash, lineWidth: 6 + drift).blur(radius: 7)
-                        outline.fill(base)
-                        outline.fill(wash.opacity(scheme == .dark ? 0.15 : 0.25))
-                        outline.fill(LinearGradient(colors: [.clear, .purple.opacity(0.05)], startPoint: .top, endPoint: .bottom))
-                        outline.strokeBorder(.white.opacity(scheme == .dark ? 0.55 : 0.96), lineWidth: 1.5)
-                    }
+                let wash = LinearGradient(stops: [
+                    .init(color: Color(red: 0.53, green: 0.88, blue: 0.94), location: 0),
+                    .init(color: Color(red: 1, green: 0.86, blue: 0.64), location: 0.46),
+                    .init(color: Color(red: 0.99, green: 0.66, blue: 0.77), location: 1)
+                ], startPoint: .leading, endPoint: .trailing)
+                ZStack {
+                    outline.stroke(wash, lineWidth: 6).blur(radius: 7)
+                    outline.fill(base)
+                    outline.fill(wash.opacity(scheme == .dark ? 0.15 : 0.25))
+                    outline.fill(LinearGradient(colors: [.clear, .purple.opacity(0.05)], startPoint: .top, endPoint: .bottom))
+                    outline.strokeBorder(.white.opacity(scheme == .dark ? 0.55 : 0.96), lineWidth: 1.5)
                 }
             } else {
                 outline.fill(base)

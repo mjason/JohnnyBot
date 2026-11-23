@@ -11,7 +11,9 @@ import UniformTypeIdentifiers
 extension Markdown.Text: InlineConvertible {
 
   func convert(attributeContainer: NSAttributeContainer, config: MarkdownRenderConfig) -> NSMutableAttributedString {
-    return NSMutableAttributedString(string: self.string).mergingAttributes(attributeContainer)
+    let result = NSMutableAttributedString(string: string).mergingAttributes(attributeContainer)
+    if attributeContainer[.link] == nil { InlineReferences.apply(to: result, config: config) }
+    return result
   }
 }
 
@@ -183,7 +185,9 @@ extension Markdown.InlineCode: InlineConvertible {
     container[.backgroundColor] = MDColor(config.inlineStyle.codeBackgroundColor)
     container[.underlineStyle] =  NSUnderlineStyle.patternDot.rawValue
     container[.underlineColor] = MDColor(config.inlineStyle.codeUnderlineColor)
-    return NSMutableAttributedString(string: codeContent).mergingAttributes(container)
+    let result = NSMutableAttributedString(string: codeContent).mergingAttributes(container)
+    if container[.link] == nil { InlineReferences.apply(to: result, config: config, isCode: true) }
+    return result
   }
 }
 
@@ -195,5 +199,33 @@ extension Markdown.Table.Cell: InlineConvertible {
       str.append(convertible.convert(attributeContainer: attributeContainer, config: config))
     }
     return str
+  }
+}
+
+private enum InlineReferences {
+  // Only match inline prose. Fenced code blocks retain their original formatting.
+  static let pattern = try! NSRegularExpression(pattern:
+    #"(?<![\w:/])(?:https?://[^\s<>"，。；！？]+|(?:(?:file://)?/|\.\.?/|[\w.-]+/)(?:[\w.@%+~-]+/)*[\w@%+~-]+(?:\.[\w-]+)+(?:[:#]L?\d+)?|[\w-]+\.(?:swift|ts|tsx|js|jsx|py|rs|go|md|json|ya?ml|toml|sh|cpp|h|css|html)(?:[:#]L?\d+)?)"#,
+    options: [.caseInsensitive])
+
+  static let codePath = try! NSRegularExpression(pattern:
+    #"^(?:(?:(?:file://)?/|\.\.?/|[\w.-]+/)[\w .@%+~/#:-]*[\w~]|Dockerfile|Makefile|\.[\w-]+)$"#)
+
+  static func apply(to text: NSMutableAttributedString, config: MarkdownRenderConfig, isCode: Bool = false) {
+    let source = text.string as NSString
+    let full = NSRange(location: 0, length: source.length)
+    let ranges = isCode && codePath.firstMatch(in: text.string, range: full) != nil
+      ? [full] : pattern.matches(in: text.string, range: full).map(\.range)
+    for var range in ranges {
+      var raw = source.substring(with: range)
+      while let last = raw.last, ".,;!?)]".contains(last) {
+        if last == ")" && raw.filter({ $0 == "(" }).count >= raw.filter({ $0 == ")" }).count { break }
+        raw.removeLast()
+        range.length -= 1
+      }
+      guard let url = URL.fromMixedEncodingString(raw) else { continue }
+      text.addAttributes([.link: url, .foregroundColor: MDColor(config.inlineStyle.linkTextColor),
+                          .underlineStyle: config.inlineStyle.linkUnderlineStyle.rawValue], range: range)
+    }
   }
 }

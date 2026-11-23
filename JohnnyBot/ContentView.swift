@@ -760,22 +760,6 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
             } else if client.prompting.contains(session.id) {
                 ProgressView().controlSize(.small).accessibilityLabel("正在回复")
             }
-#if os(macOS)
-            if workspace.selection == session.id {
-                Button {
-                    hoveredSession = nil
-                    sessionToDelete = session
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 13))
-                        .frame(width: 22, height: 22)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("删除会话")
-                .help("删除会话")
-                .disabled(!client.supportsSessionDelete || workspace.managing || client.prompting.contains(session.id))
-            }
-#endif
         }
         .frame(minHeight: 26)
         .contentShape(Rectangle())
@@ -1046,6 +1030,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 ) { permission, option in
                     run { try await client.respond(to: permission, option: option) }
                 }
+                .modifier(ProjectLinkPreview(client: client, session: id))
                 .id(id)
 
                 ZStack(alignment: .bottomTrailing) {

@@ -1,6 +1,15 @@
 {
-  "originHash" : "cd063568446bf402333c3ae065146055ca3a6a01a5a3816283b92f25018962a3",
+  "originHash" : "9db049709ff3a0bfa2edb4ab38d33e41a34c7a6b1876e6ffc6572846c70b0141",
   "pins" : [
+    {
+      "identity" : "codeeditorview",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/mchakravarty/CodeEditorView",
+      "state" : {
+        "revision" : "5386056ab53d43363083cb96069715a9608aa048",
+        "version" : "0.16.0"
+      }
+    },
     {
       "identity" : "equatable",
       "kind" : "remoteSourceControl",
@@ -33,6 +42,15 @@
       "location" : "https://github.com/junyan72/iosMath",
       "state" : {
         "revision" : "ba9ab7729b151329c54fd895a7c1859981d9484c"
+      }
+    },
+    {
+      "identity" : "rearrange",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/ChimeHQ/Rearrange.git",
+      "state" : {
+        "revision" : "5ff7f3363f7a08f77e0d761e38e6add31c2136e1",
+        "version" : "1.8.1"
       }
     },
     {

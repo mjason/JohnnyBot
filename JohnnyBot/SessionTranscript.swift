@@ -387,11 +387,7 @@ private struct TranscriptMarkdown: View {
         TranscriptMarkdownDocument(entryID: entryID, text: text, textSize: textSize, isStreaming: isStreaming, config: base)
         .id(textSize)
         .textSelection(.enabled)
-        .environment(\.openURL, OpenURLAction { url in
-            guard let scheme = url.scheme?.lowercased(),
-                  ["https", "http"].contains(scheme), url.host != nil else { return .discarded }
-            return .systemAction
-        })
+
     }
 
     private static func makeConfig(textSize: CGFloat) -> MarkdownRenderConfig {
@@ -464,7 +460,16 @@ private struct TranscriptMarkdownDocument: View {
 
     @Environment(\.transcriptMarkdownCache) private var cache
     @State private var parsed: (text: String, document: RenderableDocument)?
-    @State private var updates: AsyncStream<Snapshot>.Continuation?
+    private final class Updates {
+        var latest: Snapshot?
+        var continuation: AsyncStream<Snapshot>.Continuation?
+
+        func submit(_ value: Snapshot) {
+            latest = value
+            continuation?.yield(value)
+        }
+    }
+    @State private var updates = Updates()
 
     var body: some View {
         let snapshot = Snapshot(text: text, isStreaming: isStreaming)
@@ -478,12 +483,12 @@ private struct TranscriptMarkdownDocument: View {
                     .lineSpacing(3)
             }
         }
-        .onChange(of: snapshot) { _, next in updates?.yield(next) }
+        .onChange(of: snapshot, initial: true) { _, next in updates.submit(next) }
         .task {
             let (stream, continuation) = AsyncStream.makeStream(of: Snapshot.self, bufferingPolicy: .bufferingNewest(1))
-            updates = continuation
+            updates.continuation = continuation
             defer { continuation.finish() }
-            continuation.yield(snapshot)
+            continuation.yield(updates.latest ?? snapshot)
             let parser = MarkdownParserImpl()
             for await next in stream {
                 guard !Task.isCancelled else { break }
