@@ -13,6 +13,22 @@ import AppKit
 
 @MainActor
 struct JohnnyBotTests {
+    @Test func remembersServerTokensIndependentlyAcrossClientInstances() throws {
+        let first = "wss://test.invalid/" + UUID().uuidString
+        let second = first + "/other"
+        defer {
+            try? ServerCredentialStore.remove(first)
+            try? ServerCredentialStore.remove(second)
+        }
+        try ServerCredentialStore.save("first-test-token", for: first)
+        try ServerCredentialStore.save("second-test-token", for: second)
+        try ServerCredentialStore.save("rotated-test-token", for: first)
+        #expect(try ServerCredentialStore.token(for: first) == "rotated-test-token")
+        try ServerCredentialStore.remove(first)
+        #expect(try ServerCredentialStore.token(for: first) == nil)
+        #expect(try ServerCredentialStore.token(for: second) == "second-test-token")
+    }
+
     @Test func findsTheHomeDirectoryOnOlderServers() {
         let client = ACPClient(address: "", token: "")
 

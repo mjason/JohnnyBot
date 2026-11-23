@@ -49,9 +49,9 @@ struct SessionTranscript: View {
                 TranscriptPermissions(
                     permissions: permissions, horizontalMargin: horizontalMargin, respond: respondToPermission
                 )
+                .padding(.bottom, composerSpacing)
             }
         }
-        .padding(.bottom, composerSpacing)
         .overlay(alignment: .bottom) {
             if showsJumpToLatest {
                 jumpButton
@@ -90,10 +90,17 @@ struct SessionTranscript: View {
             showsJumpToLatest = awayFromBottom
         }
 #if os(macOS)
-        .scrollEdgeEffectHidden(true, for: [.top, .bottom])
-#else
-        .scrollEdgeEffectHidden(true, for: .bottom)
+        .scrollEdgeEffectHidden(true, for: .top)
 #endif
+        .scrollEdgeEffectStyle(.soft, for: .bottom)
+        .safeAreaBar(edge: .bottom, spacing: 0) {
+            if permissions.isEmpty {
+                Color.clear
+                    .frame(height: composerSpacing)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
         .overlay {
             if turns.isEmpty, !isResponding {
                 ContentUnavailableView("开始对话", systemImage: "text.bubble",

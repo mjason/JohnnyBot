@@ -17,10 +17,13 @@ struct ContentView: View {
     init() {
         let saved = UserDefaults.standard.stringArray(forKey: "acpServerAddresses") ?? [ACPClient.defaultAddress]
         let addresses = saved.isEmpty ? [""] : saved
-        _servers = State(initialValue: addresses.map { address in
+        let restored = addresses.map { address in
             let token = address == ACPClient.defaultAddress ? ProcessInfo.processInfo.environment["TOKEN"] ?? "" : ""
             return Server(client: ACPClient(address: address, token: token))
-        })
+        }
+        _servers = State(initialValue: restored)
+        let selected = UserDefaults.standard.string(forKey: "acpSelectedServerAddress")
+        _selectedServer = State(initialValue: restored.first { $0.client.address == selected }?.id)
     }
     @State private var selectedServer: UUID?
     @State private var confirmingRemoval = false
@@ -70,6 +73,9 @@ struct ContentView: View {
 #endif
         .onDisappear {
             for server in servers { server.client.disconnect() }
+        }
+        .onChange(of: current.client.address) { _, address in
+            if !address.isEmpty { UserDefaults.standard.set(address, forKey: "acpSelectedServerAddress") }
         }
         .onChange(of: servers.map { $0.client.address }) { _, addresses in
             let saved = addresses.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
@@ -230,6 +236,11 @@ struct ContentView: View {
         guard let index = servers.firstIndex(where: { $0.id == pendingRemoval }) else { return }
         let server = servers[index]
         let wasSelected = server.id == current.id
+        let address = server.client.address.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !address.isEmpty && !servers.contains(where: { $0.id != server.id && $0.client.address.trimmingCharacters(in: .whitespacesAndNewlines) == address }) {
+            do { try ServerCredentialStore.remove(address) }
+            catch { server.workspace.failure = error.localizedDescription; return }
+        }
         server.client.disconnect()
         servers.remove(at: index)
         if servers.isEmpty {
@@ -252,6 +263,8 @@ private final class ServerWorkspaceState {
     var expandedProjects: Set<ACPProject> = []
     var drafts: [String: String] = [:]
     var draftAttachments: [String: [ACPAttachment]] = [:]
+    var restoredCredential = false
+    var tokenBelongsToAddress = false
     var managing = false
     var failure: String?
     var preferredColumn: NavigationSplitViewColumn = .detail
@@ -318,6 +331,19 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
             .disabled(sessionName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             Button("取消", role: .cancel) {}
         }
+        .onAppear {
+            guard !workspace.restoredCredential else { return }
+            workspace.restoredCredential = true
+            let address = client.address.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !address.isEmpty else { return }
+            workspace.tokenBelongsToAddress = !client.token.isEmpty
+            do {
+                if let saved = try ServerCredentialStore.token(for: address) {
+                    client.token = saved
+                    workspace.tokenBelongsToAddress = true
+                }
+            } catch { workspace.failure = error.localizedDescription }
+        }
         .task(id: projectsToSync) { await syncProjectTitles() }
         .sheet(isPresented: $choosingProject) {
             RemoteDirectoryPicker(client: client, projects: projects, defaultPath: workspace.defaultProject?.path,
@@ -348,6 +374,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         .fileImporter(isPresented: $importing, allowedContentTypes: [.data]) { result in
             do {
                 try client.importToken(from: result.get())
+                workspace.tokenBelongsToAddress = !client.address.isEmpty
             } catch {
                 workspace.failure = error.localizedDescription
             }
@@ -769,7 +796,13 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 }
                 VStack(alignment: .leading, spacing: 0) {
                     connectionField("服务器地址", icon: "server.rack") {
-                        TextField("ws:// 或 wss://", text: $client.address)
+                        TextField("ws:// 或 wss://", text: Binding(get: { client.address }, set: { address in
+                            if client.address != address && workspace.tokenBelongsToAddress {
+                                client.token = ""
+                                workspace.tokenBelongsToAddress = false
+                            }
+                            client.address = address
+                        }))
                             .accessibilityLabel("服务器地址")
                     }
                     Divider().padding(.leading, 42)
@@ -779,6 +812,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                     }
                 }
                 .textFieldStyle(.plain)
+                .disabled(workspace.managing)
                 .autocorrectionDisabled()
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
                 .overlay { RoundedRectangle(cornerRadius: 18).strokeBorder(.quaternary) }
@@ -822,7 +856,12 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         .buttonBorderShape(.capsule)
         Button {
             manage {
+                client.address = client.address.trimmingCharacters(in: .whitespacesAndNewlines)
                 try await client.connect()
+                workspace.tokenBelongsToAddress = true
+                do {
+                    try ServerCredentialStore.save(client.token.trimmingCharacters(in: .whitespacesAndNewlines), for: client.address)
+                } catch { workspace.failure = error.localizedDescription }
                 let defaultPath = client.supportsDirectoryListing ? try? await client.listDirectories().path : nil
                 guard client.connected else { return }
                 let project = ACPProject(path: defaultPath)
