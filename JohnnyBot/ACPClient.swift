@@ -683,7 +683,13 @@ final class ACPClient {
                             reason: data?["reason"] as? String
                         ))
                     } else if let result = message["result"] {
-                        continuation.resume(returning: result as? [String: Any] ?? [:])
+                        let payload = result as? [String: Any] ?? [:]
+                        if let meta = payload["_meta"] as? [String: Any],
+                           let session = meta["johnny/session_id"] as? String,
+                           meta["johnny/prompt_running"] as? Bool == true, replayHistory[session] != nil {
+                            prompting.insert(session)
+                        }
+                        continuation.resume(returning: payload)
                     } else {
                         continuation.resume(throwing: ACPFailure(message: "服务器响应缺少 result"))
                     }
@@ -722,6 +728,16 @@ final class ACPClient {
                 try await send(["jsonrpc": "2.0", "id": id, "error": [
                     "code": code, "message": code == -32602 ? "Invalid params" : "Method not found"
                 ]], to: socket)
+            }
+        } else if method == "_johnny/prompt_finished", let sessionID {
+            prompting.remove(sessionID)
+            permissions.removeAll { $0.sessionID == sessionID }
+            let reason = params["stopReason"] as? String
+            let detail = (params["error"] as? [String: Any])?["message"] as? String
+            if let status = detail ?? reason, status != "end_turn" {
+                updateTranscript(sessionID) { history, _ in
+                    history.append(ACPEntry(kind: .status, text: status))
+                }
             }
         } else if method == "session/update", let sessionID, let update = params["update"] as? [String: Any] {
             apply(update, to: sessionID)
