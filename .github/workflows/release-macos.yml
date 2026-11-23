@@ -124,22 +124,25 @@ jobs:
           xcodebuild -project JohnnyBot.xcodeproj -scheme JohnnyBot -configuration Release \
             -destination 'generic/platform=macOS' -derivedDataPath "$RUNNER_TEMP/JohnnyBotBuild" \
             -onlyUsePackageVersionsFromResolvedFile -skipPackagePluginValidation -skipMacroValidation \
-            'ARCHS=arm64 x86_64' ONLY_ACTIVE_ARCH=NO CODE_SIGN_STYLE=Manual ENABLE_HARDENED_RUNTIME=YES \
+            'ARCHS=arm64 x86_64' ONLY_ACTIVE_ARCH=NO CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO ENABLE_HARDENED_RUNTIME=YES \
             "MARKETING_VERSION=${RELEASE_TAG#v}" "CURRENT_PROJECT_VERSION=$GITHUB_RUN_NUMBER" \
             "${signing[@]}" build
 
       - name: Verify app and signature
         run: |
           app="$RUNNER_TEMP/JohnnyBotBuild/Build/Products/Release/JohnnyBot.app"
-          lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/JohnnyBot"
+          lipo "$app/Contents/MacOS/JohnnyBot" -verify_arch arm64 x86_64
           codesign --verify --deep --strict --verbose=2 "$app"
           signature="$(codesign --display --verbose=4 "$app" 2>&1)"
           grep -Eq 'flags=0x[[:xdigit:]]+\([^)]*runtime' <<< "$signature"
-          codesign --display --entitlements - "$app" > "$RUNNER_TEMP/johnnybot-entitlements.plist"
+          codesign --display --xml --entitlements - "$app" > "$RUNNER_TEMP/johnnybot-entitlements.plist"
           entitlements="$RUNNER_TEMP/johnnybot-entitlements.plist"
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.app-sandbox' "$entitlements")" = true
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.files.user-selected.read-only' "$entitlements")" = true
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.network.client' "$entitlements")" = true
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.get-task-allow' "$entitlements" 2>/dev/null || true)" != true
+          test "$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")" = "${RELEASE_TAG#v}"
           if [[ "$VERIFY_ONLY" != true ]]; then
             grep -q '^Authority=Developer ID Application:' <<< "$signature"
             grep -Fxq "TeamIdentifier=$SIGNING_TEAM" <<< "$signature"
