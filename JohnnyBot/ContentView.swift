@@ -320,7 +320,8 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         }
         .task(id: projectsToSync) { await syncProjectTitles() }
         .sheet(isPresented: $choosingProject) {
-            RemoteDirectoryPicker(client: client, projects: projects, select: addProject)
+            RemoteDirectoryPicker(client: client, projects: projects, defaultPath: workspace.defaultProject?.path,
+                                  select: addProject)
         }
 #if !os(macOS)
         .sheet(item: $terminalSession) { session in

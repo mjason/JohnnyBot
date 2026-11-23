@@ -7,42 +7,44 @@ import Foundation
 import HighlightSwift
 
 actor HighlightTaskManager: ObservableObject {
+  struct Request: Hashable, Sendable {
+    let code: String
+    let language: String
+    let colors: HighlightColors
+  }
+
   /// Shared Highlight instance to avoid creating multiple JSContext/HLJS instances.
   /// Each Highlight() creates its own JSContext and evaluates highlight.min.js (~600KB).
   /// When multiple CodeBlockViews render concurrently, N separate JSContexts cause
   /// JavaScriptCore OOM crashes (COPILOT-IOS-3F9C, 3F7Z, 3FSQ).
   private static let sharedHighlight = Highlight()
 
-  private var latestCode: String?
-  private var latestColors: HighlightColors?
+  private var pending: Request?
   private var isProcessing = false
 
-  func enqueueCode(_ code: String, colors: HighlightColors, completion: @escaping (AttributedString) -> Void) {
-    latestCode = code
-    latestColors = colors
+  func enqueue(_ request: Request, completion: @escaping @MainActor (Request, AttributedString) -> Void) {
+    pending = request
 
     if !isProcessing {
+      isProcessing = true
       Task {
         await processQueue(completion: completion)
       }
     }
   }
 
-  private func processQueue(completion: @escaping (AttributedString) -> Void) async {
-    guard !isProcessing else { return }
+  private func processQueue(completion: @escaping @MainActor (Request, AttributedString) -> Void) async {
+    defer { isProcessing = false }
 
-    isProcessing = true
-
-    while let codeToProcess = latestCode, let colors = latestColors {
-      latestCode = nil
-
-      if let result = try? await Self.sharedHighlight.attributedText(codeToProcess, colors: colors) {
-        await MainActor.run {
-          completion(result)
-        }
+    while let request = pending {
+      pending = nil
+      guard !request.code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+      let language = request.language.split(whereSeparator: \.isWhitespace).first?.lowercased()
+      let mode = language.map(HighlightMode.languageAliasIgnoreIllegal) ?? .automatic
+      if let result = try? await Self.sharedHighlight.request(request.code, mode: mode, colors: request.colors),
+         pending == nil {
+        await completion(request, result.attributedText)
       }
     }
-
-    isProcessing = false
   }
 }

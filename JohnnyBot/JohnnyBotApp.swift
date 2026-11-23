@@ -40,10 +40,6 @@ struct JohnnyBotApp: App {
         .restorationBehavior(.disabled)
         .windowStyle(.titleBar)
         .commands { RemoteTerminalCommands() }
-        .windowIdealPlacement { _, context in
-            let frame = context.defaultDisplay.visibleRect
-            return WindowPlacement(frame.origin, size: frame.size)
-        }
 #else
         mainWindow
 #endif
@@ -79,12 +75,16 @@ private struct TerminalTitlebar: NSViewRepresentable {
 
     private final class DragView: NSView {
         private var mouseMonitor: Any?
+        private var titlebarMouseDown: NSEvent?
+        private var restoreFrame: TerminalWindowRestoreFrame?
 
         override func viewWillMove(toWindow newWindow: NSWindow?) {
             if let mouseMonitor {
                 NSEvent.removeMonitor(mouseMonitor)
                 self.mouseMonitor = nil
             }
+            titlebarMouseDown = nil
+            restoreFrame = nil
             super.viewWillMove(toWindow: newWindow)
         }
 
@@ -92,31 +92,85 @@ private struct TerminalTitlebar: NSViewRepresentable {
             super.viewDidMoveToWindow()
             guard let window else { return }
             window.titlebarSeparatorStyle = .none
-            // A transparent title bar needs a drag region above the content.
-            mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak window] event in
-                guard let window, event.window === window,
-                      !window.styleMask.contains(.fullScreen),
-                      event.locationInWindow.y >= window.contentLayoutRect.maxY else { return event }
-                let point = window.convertPoint(toScreen: event.locationInWindow)
-                for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
-                    if let button = window.standardWindowButton(kind), let buttonWindow = button.window,
-                       buttonWindow.convertToScreen(button.convert(button.bounds, to: nil)).contains(point) {
-                        return event
-                    }
-                }
+            mouseMonitor = NSEvent.addLocalMonitorForEvents(
+                matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]
+            ) { [weak self] event in
+                guard let self, let window = self.window, event.window === window,
+                      !window.styleMask.contains(.fullScreen) else { return event }
+                return self.handleTitlebar(event, in: window)
+            }
+        }
 
+        private func handleTitlebar(_ event: NSEvent, in window: NSWindow) -> NSEvent? {
+            switch event.type {
+            case .leftMouseDown:
+                titlebarMouseDown = nil
+                guard isTitlebarBackground(event, in: window) else { return event }
+                if !window.isKeyWindow { window.makeKeyAndOrderFront(nil) }
                 if event.clickCount == 2 {
                     switch UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick") {
                     case "Minimize": window.miniaturize(nil)
                     case "None": break
-                    default: window.performZoom(nil)
+                    default: toggleFill(in: window)
                     }
                 } else {
-                    window.performDrag(with: event)
+                    titlebarMouseDown = event
                 }
                 return nil
+            case .leftMouseDragged:
+                guard let mouseDown = titlebarMouseDown else { return event }
+                // Give the window server the original click once the pointer starts dragging.
+                titlebarMouseDown = nil
+                window.performDrag(with: mouseDown)
+                return nil
+            case .leftMouseUp:
+                titlebarMouseDown = nil
+            default:
+                break
+            }
+            return event
+        }
+
+        private func isTitlebarBackground(_ event: NSEvent, in window: NSWindow) -> Bool {
+            let point = window.convertPoint(toScreen: event.locationInWindow)
+            let buttons = [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton].compactMap { kind -> NSRect? in
+                guard let button = window.standardWindowButton(kind), let buttonWindow = button.window else { return nil }
+                return buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
+            }
+            guard !buttons.contains(where: { $0.contains(point) }) else { return false }
+            // SwiftUI can extend content under the title bar, so its layout rect alone is not a hit region.
+            let titlebarHeight = buttons.first.map { (window.frame.maxY - $0.midY) * 2 } ?? 28
+            return point.y >= window.frame.maxY - titlebarHeight
+        }
+
+        private func toggleFill(in window: NSWindow) {
+            guard let visibleFrame = window.screen?.visibleFrame else { return }
+            if let restoreFrame, restoreFrame.isFilled(window.frame, in: visibleFrame) {
+                self.restoreFrame = nil
+                window.setFrame(restoreFrame.restored(in: visibleFrame), display: true, animate: true)
+            } else {
+                restoreFrame = TerminalWindowRestoreFrame(frame: window.frame, display: visibleFrame)
+                window.setFrame(visibleFrame, display: true, animate: true)
             }
         }
+    }
+}
+
+struct TerminalWindowRestoreFrame {
+    let frame: NSRect
+    let display: NSRect
+
+    func isFilled(_ current: NSRect, in visibleFrame: NSRect) -> Bool {
+        abs(current.minX - visibleFrame.minX) <= 1 && abs(current.minY - visibleFrame.minY) <= 1
+            && abs(current.maxX - visibleFrame.maxX) <= 1 && abs(current.maxY - visibleFrame.maxY) <= 1
+    }
+
+    func restored(in visibleFrame: NSRect) -> NSRect {
+        let width = min(frame.width, visibleFrame.width)
+        let height = min(frame.height, visibleFrame.height)
+        let left = min(max(0, frame.minX - display.minX), visibleFrame.width - width)
+        let top = min(max(0, display.maxY - frame.maxY), visibleFrame.height - height)
+        return NSRect(x: visibleFrame.minX + left, y: visibleFrame.maxY - top - height, width: width, height: height)
     }
 }
 #endif

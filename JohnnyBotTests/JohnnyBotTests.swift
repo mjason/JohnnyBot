@@ -7,9 +7,21 @@
 
 import Testing
 @testable import JohnnyBot
+#if os(macOS)
+import AppKit
+#endif
 
 @MainActor
 struct JohnnyBotTests {
+    @Test func findsTheHomeDirectoryOnOlderServers() {
+        let client = ACPClient(address: "", token: "")
+
+        #expect(client.projectHomeDirectory(defaultPath: "/home/mj/dev/project") == "/home/mj")
+        #expect(client.projectHomeDirectory(defaultPath: "/Users/example/project") == "/Users/example")
+        #expect(client.projectHomeDirectory(defaultPath: "/root/workspace") == "/root")
+        #expect(client.projectHomeDirectory(defaultPath: "/srv/project") == nil)
+    }
+
     @Test func groupsIntermediateWorkWithoutHidingTheFinalResponse() throws {
         let turns = TranscriptTurn.group([
             ACPEntry(kind: .user, text: "First request"),
@@ -43,4 +55,21 @@ struct JohnnyBotTests {
         #expect(turn.entries[..<turn.responseStart].map(\.text) == ["Progress"])
         #expect(turn.entries[turn.responseStart...].map(\.text) == ["First answer", "Second answer"])
     }
+
+#if os(macOS)
+    @Test func restoresTerminalOnTheCurrentDisplay() {
+        let primary = NSRect(x: 0, y: 0, width: 1600, height: 950)
+        let secondary = NSRect(x: -1280, y: 200, width: 1280, height: 750)
+        let original = NSRect(x: 95, y: 180, width: 780, height: 470)
+        let restore = TerminalWindowRestoreFrame(frame: original, display: primary)
+
+        #expect(restore.isFilled(secondary, in: secondary))
+        #expect(!restore.isFilled(primary, in: secondary))
+        #expect(restore.restored(in: primary) == original)
+        #expect(restore.restored(in: secondary) == NSRect(x: -1185, y: 200, width: 780, height: 470))
+
+        let smaller = NSRect(x: 1600, y: -250, width: 640, height: 420)
+        #expect(restore.restored(in: smaller) == smaller)
+    }
+#endif
 }

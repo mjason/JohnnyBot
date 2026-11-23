@@ -5,12 +5,14 @@ import AppKit
 
 struct RemoteDirectoryPicker: View {
     private enum Navigation: Equatable {
+        case home
         case visit(String?)
         case back(String)
         case forward(String)
 
         var path: String? {
             switch self {
+            case .home: nil
             case let .visit(path): path
             case let .back(path), let .forward(path): path
             }
@@ -24,12 +26,12 @@ struct RemoteDirectoryPicker: View {
 
     let client: ACPClient
     let projects: [ACPProject]
+    let defaultPath: String?
     let select: (String) -> Void
 
     @Environment(\.dismiss) private var dismiss
-    @State private var request = Request(navigation: .visit(nil))
+    @State private var request = Request(navigation: .home)
     @State private var listing: ACPDirectoryListing?
-    @State private var defaultPath: String?
     @State private var backHistory: [String] = []
     @State private var forwardHistory: [String] = []
     @State private var selection: String?
@@ -47,6 +49,7 @@ struct RemoteDirectoryPicker: View {
     }
 
     private var chosenPath: String? { selection ?? listing?.path }
+    private var homePath: String? { client.projectHomeDirectory(defaultPath: defaultPath) }
 
     var body: some View {
 #if os(macOS)
@@ -95,9 +98,16 @@ struct RemoteDirectoryPicker: View {
                     .foregroundStyle(.secondary)
                     .padding(.leading, 8)
                     .padding(.bottom, 4)
-                location("默认目录", icon: "server.rack", path: defaultPath)
+                if let homePath {
+                    location("用户目录", icon: "house", path: homePath)
+                }
+                if let defaultPath, defaultPath != homePath {
+                    location("默认目录", icon: "server.rack", path: defaultPath)
+                }
                 location("根目录", icon: "externaldrive", path: "/")
-                let otherProjects = projects.filter { $0.path != nil && $0.path != defaultPath && $0.path != "/" }
+                let otherProjects = projects.filter {
+                    $0.path != nil && $0.path != homePath && $0.path != defaultPath && $0.path != "/"
+                }
                 if !otherProjects.isEmpty {
                     Text("项目")
                         .font(.caption.weight(.semibold))
@@ -270,13 +280,19 @@ struct RemoteDirectoryPicker: View {
 
     private func readDirectory() async {
         let navigation = request.navigation
+        let path = navigation == .home ? homePath ?? defaultPath : navigation.path
         do {
-            let result = try await client.listDirectories(path: navigation.path)
+            let result: ACPDirectoryListing
+            do {
+                result = try await client.listDirectories(path: path)
+            } catch let error as ACPFailure where navigation == .home && path != defaultPath && error.code == -32602 {
+                try Task.checkCancellation()
+                result = try await client.listDirectories(path: defaultPath)
+            }
             try Task.checkCancellation()
-            if navigation.path == nil { defaultPath = result.path }
             if let previous = listing?.path, previous != result.path {
                 switch navigation {
-                case .visit:
+                case .home, .visit:
                     backHistory.append(previous)
                     forwardHistory.removeAll()
                 case .back:

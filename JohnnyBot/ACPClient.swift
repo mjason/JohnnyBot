@@ -51,7 +51,7 @@ struct ACPDirectoryListing: Decodable {
 }
 
 struct ACPEntry: Identifiable {
-    enum Kind {
+    enum Kind: Hashable {
         case user, agent, thought, tool, plan, status
     }
 
@@ -120,6 +120,16 @@ struct ACPPermission: Identifiable {
 
 @MainActor @Observable
 final class ACPClient {
+    private struct TranscriptIndex {
+        struct Message: Hashable {
+            let kind: ACPEntry.Kind
+            let id: String
+        }
+
+        var messages: [Message: Int] = [:]
+        var tools: [String: Int] = [:]
+    }
+
     static let defaultAddress = ProcessInfo.processInfo.environment["JOHNNY_ACP_URL"]
         ?? "ws://127.0.0.1:8765/acp"
 
@@ -135,6 +145,7 @@ final class ACPClient {
     private(set) var supportsSessionLoad = false
     private(set) var supportsSessionList = false
     private(set) var supportsDirectoryListing = false
+    private var serverHomeDirectory: String?
     private(set) var supportsRemoteShell = false
     private(set) var supportsSessionRename = false
     private(set) var supportsSessionDelete = false
@@ -155,6 +166,8 @@ final class ACPClient {
     @ObservationIgnored private var listingProjects: Set<ACPProject> = []
     @ObservationIgnored private var titleRevision = 0
     @ObservationIgnored private var titleUpdates: [String: (title: String, revision: Int)] = [:]
+    @ObservationIgnored private var replayHistory: [String: [ACPEntry]] = [:]
+    @ObservationIgnored private var transcriptIndexes: [String: TranscriptIndex] = [:]
     private let replyTimingStore = ACPReplyTimingStore()
 
     func importToken(from url: URL) throws {
@@ -206,6 +219,9 @@ final class ACPClient {
             supportsPromptFiles = promptCapabilities?["embeddedContext"] as? Bool == true
             supportsSessionLoad = capabilities?["loadSession"] as? Bool == true
             supportsDirectoryListing = (metadata?["johnny/list_directories"] as? Bool) == true
+            if let home = metadata?["johnny/home_directory"] as? String, home.hasPrefix("/") {
+                serverHomeDirectory = home
+            }
             supportsSessionList = sessionCapabilities?["list"] is [String: Any]
             supportsSessionRename = sessionCapabilities?["title"] is [String: Any]
                 || sessionCapabilities?["setTitle"] is [String: Any]
@@ -249,6 +265,7 @@ final class ACPClient {
         supportsSessionLoad = false
         supportsSessionList = false
         supportsDirectoryListing = false
+        serverHomeDirectory = nil
         supportsRemoteShell = false
         supportsSessionRename = false
         supportsSessionDelete = false
@@ -270,6 +287,24 @@ final class ACPClient {
         listingProjects.removeAll()
         titleUpdates.removeAll()
         entries.removeAll()
+        replayHistory.removeAll()
+        transcriptIndexes.removeAll()
+    }
+
+    func projectHomeDirectory(defaultPath: String?) -> String? {
+        if let serverHomeDirectory { return serverHomeDirectory }
+        guard let defaultPath, defaultPath.hasPrefix("/") else { return nil }
+        // Older servers only report the configured project. Recognize standard account directories.
+        let components = defaultPath.split(separator: "/", maxSplits: 2)
+        switch components.first {
+        case "home", "Users":
+            guard components.count >= 2 else { return nil }
+            return "/\(components[0])/\(components[1])"
+        case "root":
+            return "/root"
+        default:
+            return nil
+        }
     }
 
     func listDirectories(path: String? = nil) async throws -> ACPDirectoryListing {
@@ -366,27 +401,31 @@ final class ACPClient {
 
     func load(_ session: ACPSession) async throws {
         let id = session.id
-        guard !loaded.contains(id) else { return }
+        guard !loaded.contains(id), replayHistory[id] == nil else { return }
         guard let socket else { throw ACPFailure(message: "请先连接服务器") }
-        entries[id] = []
+        replayHistory[id] = []
+        transcriptIndexes.removeValue(forKey: id)
         do {
             var params: [String: Any] = ["sessionId": id, "mcpServers": []]
             if !session.cwd.isEmpty { params["cwd"] = session.cwd }
             let result = try await call("session/load", params)
             guard self.socket === socket else { throw ACPFailure(message: "连接已断开") }
-            if let endpoint = socket.originalRequest?.url, var history = entries[id] {
+            var history = replayHistory.removeValue(forKey: id) ?? []
+            if let endpoint = socket.originalRequest?.url {
                 let timings = replyTimingStore.timings(endpoint: endpoint, sessionID: id)
                 for index in history.indices {
                     if let key = history[index].replyTimingID, let timing = timings[key] {
                         history[index].replyTiming = timing
                     }
                 }
-                entries[id] = history
             }
+            entries[id] = history
             applySessionSetup(result, to: id)
             loaded.insert(id)
         } catch {
             if self.socket === socket {
+                replayHistory.removeValue(forKey: id)
+                transcriptIndexes.removeValue(forKey: id)
                 entries.removeValue(forKey: id)
                 sessionOptions.removeValue(forKey: id)
             }
@@ -432,6 +471,7 @@ final class ACPClient {
         loaded.remove(id)
         sessionOptions.removeValue(forKey: id)
         entries.removeValue(forKey: id)
+        transcriptIndexes.removeValue(forKey: id)
         permissions.removeAll { $0.sessionID == id }
         sessions.removeAll { $0.id == id }
         titleUpdates.removeValue(forKey: id)
@@ -624,6 +664,7 @@ final class ACPClient {
     }
 
     private func receive(from socket: URLSessionWebSocketTask) async {
+        var nextYield = ContinuousClock.now + .milliseconds(8)
         do {
             while self.socket === socket {
                 let frame = try await socket.receive()
@@ -646,6 +687,10 @@ final class ACPClient {
                     } else {
                         continuation.resume(throwing: ACPFailure(message: "服务器响应缺少 result"))
                     }
+                }
+                if ContinuousClock.now >= nextYield {
+                    await Task.yield()
+                    nextYield = ContinuousClock.now + .milliseconds(8)
                 }
             }
         } catch {
@@ -683,6 +728,14 @@ final class ACPClient {
         }
     }
 
+    private func updateTranscript(_ id: String, _ apply: (inout [ACPEntry], inout TranscriptIndex) -> Void) {
+        if replayHistory[id] != nil {
+            apply(&replayHistory[id, default: []], &transcriptIndexes[id, default: TranscriptIndex()])
+        } else {
+            apply(&entries[id, default: []], &transcriptIndexes[id, default: TranscriptIndex()])
+        }
+    }
+
     private func apply(_ update: [String: Any], to id: String) {
         let kind = update["sessionUpdate"] as? String
         switch kind {
@@ -701,61 +754,67 @@ final class ACPClient {
             }
             let attachment = entryKind == .user ? ACPAttachment.replayPreview(content) : nil
             let text = attachment == nil ? content["text"] as? String ?? "[\(content["type"] as? String ?? "内容")]" : ""
-            let previousIndex: Int?
-            if let last = entries[id]?.indices.last, let previous = entries[id]?[last],
-               previous.kind == entryKind, previous.messageID == messageID,
-               (messageID != nil || (entryKind != .user && (phase == nil || previous.phase == phase))) {
-                previousIndex = last
-            } else {
-                previousIndex = messageID.flatMap { messageID in
-                    entries[id]?.lastIndex { $0.kind == entryKind && $0.messageID == messageID }
+            updateTranscript(id) { history, index in
+                let key = messageID.map { TranscriptIndex.Message(kind: entryKind, id: $0) }
+                let previousIndex: Int?
+                if let last = history.indices.last,
+                   history[last].kind == entryKind, history[last].messageID == messageID,
+                   (messageID != nil || (entryKind != .user && (phase == nil || history[last].phase == phase))) {
+                    previousIndex = last
+                } else {
+                    previousIndex = key.flatMap { index.messages[$0] }
                 }
-            }
-            if let index = previousIndex {
-                entries[id]?[index].text += text
-                if let attachment { entries[id]?[index].attachments.append(attachment) }
-                if let phase { entries[id]?[index].phase = phase }
-            } else {
-                entries[id, default: []].append(ACPEntry(kind: entryKind, text: text, messageID: messageID, phase: phase,
-                                                         attachments: attachment.map { [$0] } ?? []))
+                if let previousIndex {
+                    history[previousIndex].text += text
+                    if let attachment { history[previousIndex].attachments.append(attachment) }
+                    if let phase { history[previousIndex].phase = phase }
+                } else {
+                    if let key { index.messages[key] = history.count }
+                    history.append(ACPEntry(kind: entryKind, text: text, messageID: messageID, phase: phase,
+                                            attachments: attachment.map { [$0] } ?? []))
+                }
             }
         case "tool_call", "tool_call_update":
             guard let toolID = update["toolCallId"] as? String else { return }
-            if entries[id]?.contains(where: { $0.toolID == toolID }) != true {
-                entries[id, default: []].append(ACPEntry(kind: .tool, text: "", toolID: toolID, toolStatus: "pending"))
-            }
-            guard let index = entries[id]?.firstIndex(where: { $0.toolID == toolID }) else { return }
-            if let title = update["title"] as? String { entries[id]?[index].text = title }
-            if let kind = update["kind"] as? String { entries[id]?[index].toolKind = kind }
-            if let status = update["status"] as? String { entries[id]?[index].toolStatus = status }
-            if let locations = update["locations"] as? [[String: Any]] {
-                entries[id]?[index].toolLocations = locations.compactMap { decodeACP(ACPEntry.ToolLocation.self, from: $0) }
-            }
-            if let blocks = update["content"] as? [[String: Any]] {
-                entries[id]?[index].toolContent = blocks.compactMap { block in
-                    switch block["type"] as? String {
-                    case "content":
-                        guard let content = block["content"] as? [String: Any] else { return nil }
-                        return .text(content["text"] as? String ?? "[\(content["type"] as? String ?? "内容")]")
-                    case "diff":
-                        guard let path = block["path"] as? String else { return nil }
-                        return .diff(path: path, oldText: block["oldText"] as? String, newText: block["newText"] as? String)
-                    case "terminal":
-                        return (block["terminalId"] as? String).map(ACPEntry.ToolContent.terminal)
-                    default:
-                        return nil
+            updateTranscript(id) { history, index in
+                let offset = index.tools[toolID] ?? history.count
+                if offset == history.count {
+                    index.tools[toolID] = offset
+                    history.append(ACPEntry(kind: .tool, text: "", toolID: toolID, toolStatus: "pending"))
+                }
+                if let title = update["title"] as? String { history[offset].text = title }
+                if let kind = update["kind"] as? String { history[offset].toolKind = kind }
+                if let status = update["status"] as? String { history[offset].toolStatus = status }
+                if let locations = update["locations"] as? [[String: Any]] {
+                    history[offset].toolLocations = locations.compactMap { decodeACP(ACPEntry.ToolLocation.self, from: $0) }
+                }
+                if let blocks = update["content"] as? [[String: Any]] {
+                    history[offset].toolContent = blocks.compactMap { block in
+                        switch block["type"] as? String {
+                        case "content":
+                            guard let content = block["content"] as? [String: Any] else { return nil }
+                            return .text(content["text"] as? String ?? "[\(content["type"] as? String ?? "内容")]")
+                        case "diff":
+                            guard let path = block["path"] as? String else { return nil }
+                            return .diff(path: path, oldText: block["oldText"] as? String, newText: block["newText"] as? String)
+                        case "terminal":
+                            return (block["terminalId"] as? String).map(ACPEntry.ToolContent.terminal)
+                        default:
+                            return nil
+                        }
                     }
                 }
             }
         case "plan":
             guard let rawSteps = update["entries"] as? [[String: Any]] else { return }
             let steps = rawSteps.compactMap { decodeACP(ACPEntry.PlanStep.self, from: $0) }
-            let history = entries[id, default: []]
-            let turnStart = (history.lastIndex { $0.kind == .user } ?? -1) + 1
-            if let index = history[turnStart...].lastIndex(where: { $0.kind == .plan }) {
-                entries[id]?[index].planSteps = steps
-            } else if !steps.isEmpty {
-                entries[id, default: []].append(ACPEntry(kind: .plan, text: "", planSteps: steps))
+            updateTranscript(id) { history, _ in
+                let turnStart = (history.lastIndex { $0.kind == .user } ?? -1) + 1
+                if let index = history[turnStart...].lastIndex(where: { $0.kind == .plan }) {
+                    history[index].planSteps = steps
+                } else if !steps.isEmpty {
+                    history.append(ACPEntry(kind: .plan, text: "", planSteps: steps))
+                }
             }
         case "available_commands_update":
             guard let commands = update["availableCommands"] as? [[String: Any]] else { return }

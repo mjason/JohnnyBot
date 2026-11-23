@@ -20,7 +20,7 @@ enum ConversationLayout {
 }
 
 struct SessionTranscript: View {
-    let entries: [ACPEntry]
+    private let turns: [TranscriptTurn]
     let isResponding: Bool
     let permissions: [ACPPermission]
     let horizontalMargin: CGFloat
@@ -29,7 +29,18 @@ struct SessionTranscript: View {
 
     @State private var position = ScrollPosition(edge: .bottom)
     @State private var showsJumpToLatest = false
+    @State private var markdownCache = TranscriptMarkdownCache()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    init(entries: [ACPEntry], isResponding: Bool, permissions: [ACPPermission], horizontalMargin: CGFloat,
+         composerSpacing: CGFloat, respondToPermission: @escaping (ACPPermission, String?) -> Void) {
+        turns = TranscriptTurn.group(entries)
+        self.isResponding = isResponding
+        self.permissions = permissions
+        self.horizontalMargin = horizontalMargin
+        self.composerSpacing = composerSpacing
+        self.respondToPermission = respondToPermission
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -50,8 +61,7 @@ struct SessionTranscript: View {
     }
 
     private var messages: some View {
-        let turns = TranscriptTurn.group(entries)
-        return ScrollView {
+        ScrollView {
             LazyVStack(alignment: .leading, spacing: 18) {
                 ForEach(turns) { turn in
                     TranscriptTurnRow(
@@ -66,8 +76,14 @@ struct SessionTranscript: View {
             .padding(.bottom, max(8, composerSpacing))
             .frame(maxWidth: .infinity)
         }
+        .environment(\.transcriptMarkdownCache, markdownCache)
         .scrollPosition($position)
         .defaultScrollAnchor(.bottom)
+        .onChange(of: turns.count) { previousCount, count in
+            if count > previousCount, turns.last?.user != nil {
+                position.scrollTo(edge: .bottom)
+            }
+        }
         .onScrollGeometryChange(for: Bool.self) { geometry in
             geometry.contentSize.height > geometry.visibleRect.maxY + 90
         } action: { _, awayFromBottom in
@@ -79,7 +95,7 @@ struct SessionTranscript: View {
         .scrollEdgeEffectHidden(true, for: .bottom)
 #endif
         .overlay {
-            if entries.isEmpty, !isResponding {
+            if turns.isEmpty, !isResponding {
                 ContentUnavailableView("开始对话", systemImage: "text.bubble",
                                        description: Text("向 Agent 发送一条消息。"))
                     .allowsHitTesting(false)
@@ -109,12 +125,16 @@ struct TranscriptTurn: Identifiable {
     let id: UUID
     let user: ACPEntry?
     let entries: ArraySlice<ACPEntry>
+    let replyTiming: ACPReplyTiming?
+    let responseStart: Int
 
     private init?(user: ACPEntry?, entries: ArraySlice<ACPEntry>) {
         guard let id = user?.id ?? entries.first?.id else { return nil }
         self.id = id
         self.user = user
         self.entries = entries
+        replyTiming = entries.reversed().lazy.compactMap(\.replyTiming).first ?? user?.replyTiming
+        responseStart = Self.startOfResponse(in: entries)
     }
 
     static func group(_ entries: [ACPEntry]) -> [Self] {
@@ -131,11 +151,7 @@ struct TranscriptTurn: Identifiable {
         return turns
     }
 
-    var replyTiming: ACPReplyTiming? {
-        entries.reversed().lazy.compactMap(\.replyTiming).first ?? user?.replyTiming
-    }
-
-    var responseStart: Int {
+    private static func startOfResponse(in entries: ArraySlice<ACPEntry>) -> Int {
         guard let lastWork = entries.lastIndex(where: {
             $0.kind == .tool || $0.kind == .thought || $0.kind == .plan || $0.phase == .commentary
         }) else { return entries.startIndex }
@@ -287,13 +303,13 @@ private struct TranscriptEntryRow: View {
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
                 }
-                TranscriptMarkdown(text: entry.text, isStreaming: isStreaming)
+                TranscriptMarkdown(entryID: entry.id, text: entry.text, isStreaming: isStreaming)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         case .thought:
             if !entry.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 DisclosureGroup {
-                    TranscriptMarkdown(text: entry.text, isStreaming: isStreaming)
+                    TranscriptMarkdown(entryID: entry.id, text: entry.text, isStreaming: isStreaming)
                         .padding(.top, 5)
                 } label: {
                     Label("思考过程", systemImage: "text.alignleft")
@@ -351,6 +367,7 @@ private struct TranscriptEntryRow: View {
 }
 
 private struct TranscriptMarkdown: View {
+    let entryID: UUID
     let text: String
     let isStreaming: Bool
 
@@ -365,7 +382,7 @@ private struct TranscriptMarkdown: View {
             if isStreaming {
                 LiveTranscriptMarkdown(text: text, config: base.withShouldAnimateText(value: !reduceMotion))
             } else {
-                MarkdownView(text: text, config: base)
+                HistoricalTranscriptMarkdown(entryID: entryID, text: text, textSize: textSize, config: base)
             }
         }
         .id(textSize)
@@ -433,6 +450,78 @@ private struct TranscriptMarkdown: View {
     }
 }
 
+private struct HistoricalTranscriptMarkdown: View {
+    let entryID: UUID
+    let text: String
+    let textSize: CGFloat
+    let config: MarkdownRenderConfig
+
+    @Environment(\.transcriptMarkdownCache) private var cache
+    @State private var parsed: (text: String, document: RenderableDocument)?
+
+    private var document: RenderableDocument? {
+        cache?.document(for: entryID, text: text, size: textSize)
+            ?? (parsed?.text == text ? parsed?.document : nil)
+    }
+
+    var body: some View {
+        Group {
+            if let document {
+                DocumentView(renderableDocument: document, config: config)
+            } else {
+                Text(verbatim: text)
+                    .font(.system(size: textSize))
+                    .lineSpacing(3)
+            }
+        }
+        .task(id: text) {
+            guard document == nil else { return }
+            let document = await MarkdownParserImpl().parse(text: text, config: config)
+            guard !Task.isCancelled else { return }
+            cache?.store(document, for: entryID, text: text, size: textSize)
+            parsed = (text, document)
+        }
+    }
+}
+
+@MainActor
+private final class TranscriptMarkdownCache {
+    private final class Entry {
+        let text: String
+        let document: RenderableDocument
+
+        init(text: String, document: RenderableDocument) {
+            self.text = text
+            self.document = document
+        }
+    }
+
+    private let entries = NSCache<NSString, Entry>()
+
+    init() {
+        entries.countLimit = 512
+        entries.totalCostLimit = 16 * 1024 * 1024
+    }
+
+    func document(for id: UUID, text: String, size: CGFloat) -> RenderableDocument? {
+        let cached = entries.object(forKey: key(for: id, size: size))
+        return cached?.text == text ? cached?.document : nil
+    }
+
+    func store(_ document: RenderableDocument, for id: UUID, text: String, size: CGFloat) {
+        entries.setObject(Entry(text: text, document: document), forKey: key(for: id, size: size),
+                          cost: max(512, text.utf8.count * 6))
+    }
+
+    private func key(for id: UUID, size: CGFloat) -> NSString {
+        "\(id.uuidString)/\(size)" as NSString
+    }
+}
+
+private extension EnvironmentValues {
+    @Entry var transcriptMarkdownCache: TranscriptMarkdownCache?
+}
+
 private struct LiveTranscriptMarkdown: View {
     let text: String
     let config: MarkdownRenderConfig
@@ -440,7 +529,7 @@ private struct LiveTranscriptMarkdown: View {
     @State private var source: TranscriptMarkdownSource?
 
     var body: some View {
-        Group {
+        VStack(alignment: .leading, spacing: 0) {
             if let source {
                 StreamedMarkdownView(source: source, config: config)
             }

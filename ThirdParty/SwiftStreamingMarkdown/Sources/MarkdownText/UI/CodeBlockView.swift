@@ -17,7 +17,7 @@ struct CodeBlockView: View {
   let onCodeCopied: (() -> Void)?
 
   @State var copied: Bool = false
-  @State var attributedString: AttributedString?
+  @State private var highlighted: (request: HighlightTaskManager.Request, text: AttributedString)?
   @StateObject private var taskManager: HighlightTaskManager = HighlightTaskManager()
 
   init(language: String, code: String, onCodeCopied: (() -> Void)? = nil) {
@@ -26,11 +26,15 @@ struct CodeBlockView: View {
     self.onCodeCopied = onCodeCopied
   }
 
-  private func updateAttributedString(code: String, scheme: ColorScheme) async {
-    let colors = config.codeBlockConfig.theme.highlightColors(for: scheme)
-    await taskManager.enqueueCode(code, colors: colors) { newAttributedString in
-      self.attributedString = newAttributedString
+  private var highlightRequest: HighlightTaskManager.Request {
+    .init(code: code, language: language, colors: config.codeBlockConfig.theme.highlightColors(for: colorScheme))
+  }
+
+  private var renderedCode: AttributedString {
+    guard let highlighted, highlighted.request == highlightRequest else {
+      return AttributedString(code)
     }
+    return highlighted.text
   }
 
   private var backgroundColor: Color? {
@@ -73,7 +77,7 @@ struct CodeBlockView: View {
     ScrollView(.horizontal) {
       HStack {
         if #available(iOS 16.1, *) {  // Minimum version for HighlightSwift
-          Text(attributedString ?? AttributedString(code))
+          Text(renderedCode)
             .font(config.codeBlockConfig.codeTextFonts)
             .transition(.opacity)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -135,26 +139,11 @@ struct CodeBlockView: View {
         }
       }
     })
-    .onChange(of: code, perform: { value in
-      Task {
-        await updateAttributedString(code: value, scheme: colorScheme)
+    .task(id: highlightRequest) {
+      await taskManager.enqueue(highlightRequest) { request, text in
+        highlighted = (request, text)
       }
-    })
-    .onChange(of: colorScheme, perform: { newValue in
-      Task {
-        await updateAttributedString(code: code, scheme: newValue)
-      }
-    })
-    .onChange(of: config, perform: { _ in
-      Task {
-        await updateAttributedString(code: code, scheme: colorScheme)
-      }
-    })
-    .onAppear(perform: {
-      Task {
-        await updateAttributedString(code: code, scheme: colorScheme)
-      }
-    })
+    }
   }
 }
 
