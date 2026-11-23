@@ -91,6 +91,29 @@ struct JohnnyBotTests {
     }
 
 #if os(macOS)
+    @Test func mainWindowKeepsItsSeparatorHiddenAfterToolbarChanges() async throws {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
+                              styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        window.orderBack(nil)
+        defer { window.orderOut(nil) }
+        let policy = MainWindowTitlebarView()
+        window.contentView = policy
+        #expect(window.titlebarSeparatorStyle == .none)
+        for style in [NSTitlebarSeparatorStyle.automatic, .line] {
+            window.toolbar = NSToolbar(identifier: UUID().uuidString)
+            window.titlebarSeparatorStyle = style
+            window.update()
+            for _ in 0..<20 where window.titlebarSeparatorStyle != .none {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            #expect(window.titlebarSeparatorStyle == .none)
+        }
+        window.contentView = nil
+        window.titlebarSeparatorStyle = .line
+        await Task.yield()
+        #expect(window.titlebarSeparatorStyle == .line)
+    }
+
     @Test func restoresTerminalOnTheCurrentDisplay() {
         let primary = NSRect(x: 0, y: 0, width: 1600, height: 950)
         let secondary = NSRect(x: -1280, y: 200, width: 1280, height: 750)

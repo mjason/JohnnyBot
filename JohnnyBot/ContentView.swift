@@ -212,6 +212,7 @@ struct ContentView: View {
         .contextMenu {
             if server.client.connected {
                 Button("断开连接", systemImage: "power", role: .destructive) {
+                    UserDefaults.standard.set(true, forKey: "acpManuallyDisconnected." + server.client.address)
                     server.client.disconnect()
                 }
             }
@@ -240,6 +241,10 @@ struct ContentView: View {
         if !address.isEmpty && !servers.contains(where: { $0.id != server.id && $0.client.address.trimmingCharacters(in: .whitespacesAndNewlines) == address }) {
             do { try ServerCredentialStore.remove(address) }
             catch { server.workspace.failure = error.localizedDescription; return }
+        }
+        if !servers.contains(where: { $0.id != server.id && $0.client.address == address }) {
+            UserDefaults.standard.removeObject(forKey: "acpManuallyDisconnected." + address)
+            UserDefaults.standard.removeObject(forKey: "acpLastSession." + address)
         }
         server.client.disconnect()
         servers.remove(at: index)
@@ -281,6 +286,7 @@ private final class ServerWorkspaceState {
     var draftAttachments: [String: [ACPAttachment]] = [:]
     var restoredCredential = false
     var tokenBelongsToAddress = false
+    var resumeConnection = false
     var managing = false
     var failure: String?
     var preferredColumn: NavigationSplitViewColumn = .detail
@@ -326,7 +332,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                     workspace.drafts.removeValue(forKey: session.id)
                     workspace.draftAttachments.removeValue(forKey: session.id)
                     if workspace.selection == session.id {
-                        workspace.selection = nil
+                        forgetSelection()
                     }
                 }
             }
@@ -348,17 +354,23 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
             Button("取消", role: .cancel) {}
         }
         .onAppear {
-            guard !workspace.restoredCredential else { return }
-            workspace.restoredCredential = true
-            let address = client.address.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !address.isEmpty else { return }
-            workspace.tokenBelongsToAddress = !client.token.isEmpty
-            do {
-                if let saved = try ServerCredentialStore.token(for: address) {
-                    client.token = saved
-                    workspace.tokenBelongsToAddress = true
-                }
-            } catch { workspace.failure = error.localizedDescription }
+            if !workspace.restoredCredential {
+                workspace.restoredCredential = true
+                let address = client.address.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !address.isEmpty else { return }
+                workspace.tokenBelongsToAddress = !client.token.isEmpty
+                do {
+                    if let saved = try ServerCredentialStore.token(for: address) {
+                        client.token = saved
+                        workspace.tokenBelongsToAddress = true
+                    }
+                    workspace.resumeConnection = workspace.tokenBelongsToAddress
+                } catch { workspace.failure = error.localizedDescription; return }
+            }
+            reconnectIfNeeded()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { reconnectIfNeeded() }
         }
         .task(id: projectsToSync) { await syncProjectTitles() }
         .sheet(isPresented: $choosingProject) {
@@ -374,6 +386,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
             workspace.sessionLoadFailure = nil
             if let id, let project = projects.first(where: { client.projectSessionIDs[$0]?.contains(id) == true }) {
                 workspace.activeProject = project
+                UserDefaults.standard.set(["id": id, "project": project.id], forKey: "acpLastSession." + client.address)
             }
             openSelectedSession()
         }
@@ -410,6 +423,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 workspace.activeProject = nil
                 workspace.addedProjects.removeAll()
                 workspace.expandedProjects.removeAll()
+                if scenePhase == .active { reconnectIfNeeded() }
             }
         }
     }
@@ -541,6 +555,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
 #endif
         }
 #if os(macOS)
+        .scrollEdgeEffectHidden(true, for: .top)
         .toolbar {
             if columns == .detailOnly {
                 ToolbarItem(placement: .navigation) {
@@ -707,7 +722,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                     workspace.activeProject = project
                     if let currentSession = workspace.selection,
                        client.projectSessionIDs[project]?.contains(currentSession) != true {
-                        workspace.selection = nil
+                        forgetSelection()
                     }
                     if case .first = tap { isExpanded.wrappedValue.toggle() }
                 })
@@ -787,7 +802,10 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 .accessibilityLabel("已连接到 \(client.status)")
             Spacer()
             Menu {
-                Button("断开连接", systemImage: "power", role: .destructive) { client.disconnect() }
+                Button("断开连接", systemImage: "power", role: .destructive) {
+                    UserDefaults.standard.set(true, forKey: "acpManuallyDisconnected." + client.address)
+                    client.disconnect()
+                }
             } label: {
                 Label("连接选项", systemImage: "ellipsis.circle")
                     .labelStyle(.iconOnly)
@@ -823,6 +841,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                                 client.token = ""
                                 workspace.tokenBelongsToAddress = false
                             }
+                            if client.address != address { workspace.resumeConnection = false }
                             client.address = address
                         }))
                             .accessibilityLabel("服务器地址")
@@ -877,29 +896,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         .buttonStyle(.bordered)
         .buttonBorderShape(.capsule)
         Button {
-            manage {
-                client.address = client.address.trimmingCharacters(in: .whitespacesAndNewlines)
-                try await client.connect()
-                workspace.tokenBelongsToAddress = true
-                do {
-                    try ServerCredentialStore.save(client.token.trimmingCharacters(in: .whitespacesAndNewlines), for: client.address)
-                } catch { workspace.failure = error.localizedDescription }
-                let defaultPath = client.supportsDirectoryListing ? try? await client.listDirectories().path : nil
-                guard client.connected else { return }
-                let project = ACPProject(path: defaultPath)
-                let saved = UserDefaults.standard.dictionary(forKey: "acpProjectPaths") ?? [:]
-                let paths = saved[client.address] as? [String] ?? []
-                workspace.addedProjects = paths.map { ACPProject(path: $0) }
-                workspace.defaultProject = project
-                workspace.activeProject = project
-                workspace.projectSectionExpanded = UserDefaults.standard.object(forKey: "acpProjectSectionExpanded." + client.address) as? Bool ?? true
-                workspace.expandedProjects = SidebarExpansion.restore(server: client.address, projects: projects, defaultProject: project)
-                for visible in projects where workspace.expandedProjects.contains(visible) {
-                    guard client.connected else { return }
-                    do { try await client.listSessions(in: visible) }
-                    catch { if client.connected { workspace.failure = error.localizedDescription } }
-                }
-            }
+            connect(automatic: false)
         } label: {
             Label("连接", systemImage: "arrow.right")
         }
@@ -907,6 +904,62 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         .buttonBorderShape(.capsule)
         .disabled(client.address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
                   client.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+
+    private func reconnectIfNeeded() {
+        guard !client.connected, !client.token.isEmpty, workspace.resumeConnection, workspace.tokenBelongsToAddress,
+              !UserDefaults.standard.bool(forKey: "acpManuallyDisconnected." + client.address) else { return }
+        connect(automatic: true)
+    }
+
+    private func connect(automatic: Bool) {
+        manage {
+            client.address = client.address.trimmingCharacters(in: .whitespacesAndNewlines)
+            try await client.connect()
+            UserDefaults.standard.removeObject(forKey: "acpManuallyDisconnected." + client.address)
+            workspace.tokenBelongsToAddress = true
+            workspace.resumeConnection = true
+            if !automatic {
+                do {
+                    try ServerCredentialStore.save(client.token.trimmingCharacters(in: .whitespacesAndNewlines), for: client.address)
+                } catch { workspace.failure = error.localizedDescription }
+            }
+            let defaultPath = client.supportsDirectoryListing ? try? await client.listDirectories().path : nil
+            guard client.connected else { return }
+            let project = ACPProject(path: defaultPath)
+            let saved = UserDefaults.standard.dictionary(forKey: "acpProjectPaths") ?? [:]
+            let paths = saved[client.address] as? [String] ?? []
+            workspace.addedProjects = paths.map { ACPProject(path: $0) }
+            workspace.defaultProject = project
+            workspace.activeProject = project
+            workspace.projectSectionExpanded = UserDefaults.standard.object(forKey: "acpProjectSectionExpanded." + client.address) as? Bool ?? true
+            workspace.expandedProjects = SidebarExpansion.restore(server: client.address, projects: projects, defaultProject: project)
+            let key = "acpLastSession." + client.address
+            let last = UserDefaults.standard.dictionary(forKey: key) as? [String: String]
+            let lastProject = projects.first { $0.id == last?["project"] }
+            let initial = workspace.selection
+            for visible in projects where workspace.expandedProjects.contains(visible) || visible == lastProject {
+                guard client.connected else { return }
+                do {
+                    try await client.listSessions(in: visible)
+                    if visible == lastProject, let id = last?["id"], workspace.selection == initial,
+                       client.connected, client.supportsSessionList {
+                        if client.projectSessionIDs[visible]?.contains(id) == true {
+                            workspace.activeProject = visible
+                            workspace.selection = id
+                            workspace.preferredColumn = .detail
+                        } else {
+                            UserDefaults.standard.removeObject(forKey: key)
+                        }
+                    }
+                } catch { if client.connected { workspace.failure = error.localizedDescription } }
+            }
+        }
+    }
+
+    private func forgetSelection() {
+        UserDefaults.standard.removeObject(forKey: "acpLastSession." + client.address)
+        workspace.selection = nil
     }
 
     private func refresh(_ project: ACPProject) {
@@ -931,7 +984,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         setProject(project, expanded: false)
         if workspace.activeProject == project { workspace.activeProject = workspace.defaultProject }
         if let selection = workspace.selection, client.projectSessionIDs[project]?.contains(selection) == true {
-            workspace.selection = nil
+            forgetSelection()
         }
         saveProjects()
     }
@@ -1033,7 +1086,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                     Button {
                         manage {
                             try await client.close(id)
-                            if workspace.selection == id { workspace.selection = nil }
+                            if workspace.selection == id { forgetSelection() }
                         }
                     } label: {
                         Label("释放会话", systemImage: "rectangle.portrait.and.arrow.right")

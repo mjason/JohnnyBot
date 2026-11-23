@@ -50,6 +50,7 @@ struct JohnnyBotApp: App {
             ContentView()
                 .environment(terminals)
 #if os(macOS)
+                .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
                 .background(HideTitlebarSeparator())
 #endif
         }
@@ -58,14 +59,28 @@ struct JohnnyBotApp: App {
 
 #if os(macOS)
 private struct HideTitlebarSeparator: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView { TitlebarView() }
-    func updateNSView(_ nsView: NSView, context: Context) {}
+    func makeNSView(context: Context) -> MainWindowTitlebarView { MainWindowTitlebarView() }
+    func updateNSView(_ nsView: MainWindowTitlebarView, context: Context) {}
+}
 
-    private final class TitlebarView: NSView {
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            window?.titlebarSeparatorStyle = .none
+final class MainWindowTitlebarView: NSView {
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if let window { NotificationCenter.default.removeObserver(self, name: nil, object: window) }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard let window else { return }
+        applyStyle()
+        for event in [NSWindow.didUpdateNotification, NSWindow.didBecomeKeyNotification] {
+            NotificationCenter.default.addObserver(self, selector: #selector(applyStyle), name: event, object: window)
         }
+    }
+
+    @objc private func applyStyle() {
+        guard let window, window.titlebarSeparatorStyle != .none else { return }
+        window.titlebarSeparatorStyle = .none
     }
 }
 
