@@ -2,16 +2,25 @@ import SwiftUI
 #if os(macOS)
 import AppKit
 #endif
+#if os(macOS) && !DEBUG
+import JohnnyBotUpdater
+#endif
 
 @main
 struct JohnnyBotApp: App {
     @State private var terminals = RemoteTerminalWindows()
+#if os(macOS) && !DEBUG
+    private let updateCommands = AppUpdateCommands()
+#endif
 
     var body: some Scene {
 #if os(macOS)
         mainWindow
             .defaultSize(width: 1020, height: 680)
             .defaultLaunchBehavior(.presented)
+#if !DEBUG
+            .commands { updateCommands }
+#endif
 
         Window("远程终端", id: "remote-terminal") {
             Group {

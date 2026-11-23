@@ -7,9 +7,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Release tag, for example v1.0.0
+        description: Release tag, for example v1.0.1
         required: true
-        default: v1.0.0
         type: string
       verify_only:
         description: Verify an ad hoc signed build without publishing
@@ -129,6 +128,19 @@ jobs:
             "MARKETING_VERSION=${RELEASE_TAG#v}" "CURRENT_PROJECT_VERSION=$GITHUB_RUN_NUMBER" \
             "${signing[@]}" build
 
+      - name: Sign Sparkle installer and helpers
+        if: ${{ !inputs.verify_only }}
+        run: |
+          app="$RUNNER_TEMP/JohnnyBotBuild/Build/Products/Release/JohnnyBot.app"
+          framework="$app/Contents/Frameworks/Sparkle.framework"
+          signing=(--force --sign "$SIGNING_FINGERPRINT" --timestamp --options runtime
+            --keychain "$RUNNER_TEMP/johnnybot-release.keychain-db" --preserve-metadata=entitlements,identifier)
+          for component in XPCServices/Installer.xpc XPCServices/Downloader.xpc Autoupdate Updater.app; do
+            codesign "${signing[@]}" "$framework/Versions/B/$component"
+          done
+          codesign "${signing[@]}" "$framework"
+          codesign "${signing[@]}" "$app"
+
       - name: Verify app and signature
         run: |
           app="$RUNNER_TEMP/JohnnyBotBuild/Build/Products/Release/JohnnyBot.app"
@@ -141,8 +153,14 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.app-sandbox' "$entitlements")" = true
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.files.user-selected.read-only' "$entitlements")" = true
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.network.client' "$entitlements")" = true
+          bundle_id="$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")"
+          mach_lookup='com.apple.security.temporary-exception.mach-lookup.global-name'
+          test "$(/usr/libexec/PlistBuddy -c "Print :$mach_lookup:0" "$entitlements")" = "$bundle_id-spks"
+          test "$(/usr/libexec/PlistBuddy -c "Print :$mach_lookup:1" "$entitlements")" = "$bundle_id-spki"
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.get-task-allow' "$entitlements" 2>/dev/null || true)" != true
           test "$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")" = "${RELEASE_TAG#v}"
+          test "$(plutil -extract SURequireSignedFeed raw "$app/Contents/Info.plist")" = true
+          test -d "$app/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Installer.xpc"
           if [[ "$VERIFY_ONLY" != true ]]; then
             grep -q '^Authority=Developer ID Application:' <<< "$signature"
             grep -Fxq "TeamIdentifier=$SIGNING_TEAM" <<< "$signature"
@@ -179,18 +197,38 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$app"
           syspolicy_check distribution "$app"
 
-      - name: Publish GitHub release
+      - name: Sign update and generate appcast
         if: ${{ !inputs.verify_only }}
         env:
-          GH_TOKEN: ${{ github.token }}
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
         run: |
+          if [[ -z "$SPARKLE_ED_PRIVATE_KEY" ]]; then
+            echo "::error::Missing Actions secret SPARKLE_ED_PRIVATE_KEY."
+            exit 1
+          fi
           app="$RUNNER_TEMP/JohnnyBotBuild/Build/Products/Release/JohnnyBot.app"
+          tools="$RUNNER_TEMP/JohnnyBotBuild/SourcePackages/artifacts/sparkle/Sparkle/bin"
           archive="JohnnyBot-${RELEASE_TAG#v}-macOS-universal.zip"
           mkdir "$RUNNER_TEMP/dist"
           cd "$RUNNER_TEMP/dist"
           ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
           shasum -a 256 "$archive" > "$archive.sha256"
-          gh release create "$RELEASE_TAG" "$archive" "$archive.sha256" \
+          release="https://github.com/$GITHUB_REPOSITORY/releases"
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" | "$tools/generate_appcast" --ed-key-file - \
+            --maximum-deltas 0 --download-url-prefix "$release/download/$RELEASE_TAG/" \
+            --link "$release/tag/$RELEASE_TAG" "$PWD"
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" | "$tools/sign_update" --ed-key-file - --verify appcast.xml
+          test "$(xmllint --xpath 'string(/rss/channel/item/enclosure/@url)' appcast.xml)" = "$release/download/$RELEASE_TAG/$archive"
+          test "$(xmllint --xpath 'string(/rss/channel/item/enclosure/@length)' appcast.xml)" = "$(stat -f %z "$archive")"
+
+      - name: Publish GitHub release
+        if: ${{ !inputs.verify_only }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd "$RUNNER_TEMP/dist"
+          archive="JohnnyBot-${RELEASE_TAG#v}-macOS-universal.zip"
+          gh release create "$RELEASE_TAG" "$archive" "$archive.sha256" appcast.xml \
             --repo "$GITHUB_REPOSITORY" --target "$RELEASE_COMMIT" --title "JohnnyBot ${RELEASE_TAG#v}" --generate-notes
 
       - name: Remove temporary signing keychain

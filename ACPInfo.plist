@@ -4,6 +4,18 @@
 <dict>
     <key>NSLocalNetworkUsageDescription</key>
     <string>连接局域网中的 ACP Agent。</string>
+    <key>SUFeedURL</key>
+    <string>https://github.com/mjason/JohnnyBot/releases/latest/download/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>lIc0BPj+jN5PAG+0EpR0FE6l5cD/uAKVWNI2vNWtkMM=</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUEnableInstallerLauncherService</key>
+    <true/>
+    <key>SUVerifyUpdateBeforeExtraction</key>
+    <true/>
+    <key>SURequireSignedFeed</key>
+    <true/>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsLocalNetworking</key>

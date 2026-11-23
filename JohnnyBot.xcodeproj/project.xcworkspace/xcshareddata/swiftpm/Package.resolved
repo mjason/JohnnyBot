@@ -1,5 +1,5 @@
 {
-  "originHash" : "27dd5ff2d8ec5d975c9684b0d4962efca4db2ebbf3dd1b597417c9f5f5fd4bdc",
+  "originHash" : "cd063568446bf402333c3ae065146055ca3a6a01a5a3816283b92f25018962a3",
   "pins" : [
     {
       "identity" : "equatable",
@@ -33,6 +33,15 @@
       "location" : "https://github.com/junyan72/iosMath",
       "state" : {
         "revision" : "ba9ab7729b151329c54fd895a7c1859981d9484c"
+      }
+    },
+    {
+      "identity" : "sparkle",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/sparkle-project/Sparkle",
+      "state" : {
+        "revision" : "ab7d71291238df6e0492143b120c9b696a35f603",
+        "version" : "2.10.1"
       }
     },
     {

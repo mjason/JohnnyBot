@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		9EB8AE3D2F70000000A00001 /* SwiftStreamingMarkdown in Frameworks */ = {isa = PBXBuildFile; productRef = 9EB8AE3D2F70000000A00003 /* SwiftStreamingMarkdown */; };
 		9EB8AE3D2F70000000A00004 /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = 9EB8AE3D2F70000000A00006 /* SwiftTerm */; };
+		9EB8AE3D2F70000000A00007 /* JohnnyBotUpdater in Frameworks */ = {isa = PBXBuildFile; productRef = 9EB8AE3D2F70000000A00009 /* JohnnyBotUpdater */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -59,6 +60,7 @@
 			files = (
 				9EB8AE3D2F70000000A00001 /* SwiftStreamingMarkdown in Frameworks */,
 				9EB8AE3D2F70000000A00004 /* SwiftTerm in Frameworks */,
+				9EB8AE3D2F70000000A00007 /* JohnnyBotUpdater in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -113,6 +115,7 @@
 			packageProductDependencies = (
 				9EB8AE3D2F70000000A00003 /* SwiftStreamingMarkdown */,
 				9EB8AE3D2F70000000A00006 /* SwiftTerm */,
+				9EB8AE3D2F70000000A00009 /* JohnnyBotUpdater */,
 			);
 			productName = JohnnyBot;
 			productReference = 2D5B3E1D30B2A290005338F4 /* JohnnyBot.app */;
@@ -199,6 +202,7 @@
 			packageReferences = (
 				9EB8AE3D2F70000000A00002 /* XCLocalSwiftPackageReference "ThirdParty/SwiftStreamingMarkdown" */,
 				9EB8AE3D2F70000000A00005 /* XCRemoteSwiftPackageReference "SwiftTerm" */,
+				9EB8AE3D2F70000000A00008 /* XCLocalSwiftPackageReference "Packages/JohnnyBotUpdater" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 2D5B3DE430B29907005338F4;
@@ -622,6 +626,10 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = ThirdParty/SwiftStreamingMarkdown;
 		};
+		9EB8AE3D2F70000000A00008 /* XCLocalSwiftPackageReference "Packages/JohnnyBotUpdater" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/JohnnyBotUpdater;
+		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCRemoteSwiftPackageReference section */
@@ -645,6 +653,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 9EB8AE3D2F70000000A00005 /* XCRemoteSwiftPackageReference "SwiftTerm" */;
 			productName = SwiftTerm;
+		};
+		9EB8AE3D2F70000000A00009 /* JohnnyBotUpdater */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 9EB8AE3D2F70000000A00008 /* XCLocalSwiftPackageReference "Packages/JohnnyBotUpdater" */;
+			productName = JohnnyBotUpdater;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

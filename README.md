@@ -15,7 +15,9 @@ JohnnyBot 是 macOS 和 iOS 上的 ACP 客户端。它通过 WebSocket 连接远
 
 ## 发布 macOS 版
 
-[Release macOS](https://github.com/mjason/JohnnyBot/actions/workflows/release-macos.yml) 构建同时支持 Apple 芯片和 Intel 的 macOS 26.5+ 版本。它使用 Developer ID 签名，提交 Apple 公证，再将带公证票据的 App 压缩包和 SHA-256 校验文件上传到 [GitHub Releases](https://github.com/mjason/JohnnyBot/releases)。
+[Release macOS](https://github.com/mjason/JohnnyBot/actions/workflows/release-macos.yml) 构建同时支持 Apple 芯片和 Intel 的 macOS 26.5+ 版本。它使用 Developer ID 签名，提交 Apple 公证，再将带公证票据的 App 压缩包、SHA-256 校验文件和签名更新源上传到 [GitHub Releases](https://github.com/mjason/JohnnyBot/releases)。
+
+从 1.0.1 起，macOS 发布版会自动检查 GitHub Releases 上的更新。也可以在 **JohnnyBot → 检查更新…** 手动检查，并在更新提示中选择是否自动安装后续版本。已安装 1.0.0 的用户需要先手动安装一次新版。
 
 在仓库的 [Actions secrets](https://github.com/mjason/JohnnyBot/settings/secrets/actions) 中配置以下值。
 
@@ -26,6 +28,7 @@ JohnnyBot 是 macOS 和 iOS 上的 ACP 客户端。它通过 WebSocket 连接远
 | `APPLE_NOTARY_KEY_P8_BASE64` | [App Store Connect 团队 API 密钥](https://appstoreconnect.apple.com/access/integrations/api)的 `.p8` 文件，经 Base64 编码 |
 | `APPLE_NOTARY_KEY_ID` | 团队 API 密钥的 Key ID |
 | `APPLE_NOTARY_ISSUER_ID` | 团队 API 密钥的 Issuer ID |
+| `SPARKLE_ED_PRIVATE_KEY` | Sparkle `generate_keys -x` 导出的 EdDSA 私钥，对应 `ACPInfo.plist` 中的公钥 |
 
 从 `main` 手动运行工作流并填写版本，例如 `v1.0.0`，或在 `main` 的提交上推送该格式的标签。勾选 `verify_only` 可以在配置凭据前验证构建，验证模式不会创建 Release。
 
