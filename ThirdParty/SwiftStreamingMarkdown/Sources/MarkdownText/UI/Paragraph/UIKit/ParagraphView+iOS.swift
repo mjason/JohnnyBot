@@ -52,6 +52,10 @@ struct ParagraphView: UIViewRepresentable {
     }
 
     // Check if content or lineSpacing changed - if so, clear the cache
+    // SwiftUI can measure the next snapshot before updating the native text view.
+    if uiView.paragraphContents != contents || uiView.lineSpacing != lineSpacing {
+      uiView.setParagraphContents(contents, lineSpacing: lineSpacing, animatedByWord: false)
+    }
     if contents != context.coordinator.lastContents || lineSpacing != context.coordinator.lastLineSpacing {
       context.coordinator.sizeCache.removeAll()
       context.coordinator.lastContents = contents

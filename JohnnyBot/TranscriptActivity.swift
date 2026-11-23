@@ -14,23 +14,21 @@ struct TranscriptActivity: View {
                 .font(.callout)
                 .foregroundStyle(isAwaitingPermission ? Color.orange : Color.secondary)
                 .frame(width: 18)
-                .contentTransition(.symbolEffect(.replace))
                 .symbolEffect(.pulse, options: .repeating, isActive: !reduceMotion && scenePhase == .active && !isAwaitingPermission)
                 .accessibilityHidden(true)
             Text(activity.title)
                 .fontWeight(.medium)
-                .contentTransition(.opacity)
                 .layoutPriority(1)
             if let detail = activity.detail {
                 Text(detail)
                     .lineLimit(1)
-                    .contentTransition(.opacity)
-            }
+                }
         }
+        .lineLimit(1)
+        .fixedSize(horizontal: false, vertical: true)
         .frame(maxWidth: .infinity, alignment: .leading)
         .font(.callout)
         .foregroundStyle(.secondary)
-        .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: activity)
         .accessibilityElement(children: .combine)
     }
 

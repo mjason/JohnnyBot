@@ -253,6 +253,21 @@ struct ContentView: View {
 
 }
 
+enum SidebarExpansion {
+    static func restore(server: String, projects: [ACPProject], defaultProject: ACPProject,
+                        defaults: UserDefaults = .standard) -> Set<ACPProject> {
+        guard let ids = defaults.stringArray(forKey: "acpExpandedProjects." + server) else {
+            return [defaultProject]
+        }
+        let expanded = Set(ids)
+        return Set(projects.filter { expanded.contains($0.id) })
+    }
+
+    static func save(_ projects: Set<ACPProject>, server: String, defaults: UserDefaults = .standard) {
+        defaults.set(projects.map(\.id).sorted(), forKey: "acpExpandedProjects." + server)
+    }
+}
+
 @Observable @MainActor
 private final class ServerWorkspaceState {
     var selection: String?
@@ -261,6 +276,7 @@ private final class ServerWorkspaceState {
     var activeProject: ACPProject?
     var addedProjects: [ACPProject] = []
     var expandedProjects: Set<ACPProject> = []
+    var projectSectionExpanded = true
     var drafts: [String: String] = [:]
     var draftAttachments: [String: [ACPAttachment]] = [:]
     var restoredCredential = false
@@ -401,7 +417,15 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
     private var workspaceLayout: some View {
         NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $workspace.preferredColumn) {
             List(selection: $workspace.selection) {
-                Section("项目") {
+                Section("项目", isExpanded: Binding(
+                    get: { workspace.projectSectionExpanded },
+                    set: { expanded in
+                        workspace.projectSectionExpanded = expanded
+                        if client.connected {
+                            UserDefaults.standard.set(expanded, forKey: "acpProjectSectionExpanded." + client.address)
+                        }
+                    }
+                )) {
                     if projects.isEmpty {
                         Text(client.connected ? "正在加载项目…" : "连接服务器后显示项目")
                             .font(.callout)
@@ -639,12 +663,10 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         let isExpanded = Binding(
             get: { workspace.expandedProjects.contains(project) },
             set: { expanded in
+                setProject(project, expanded: expanded)
                 if expanded {
-                    workspace.expandedProjects.insert(project)
                     workspace.activeProject = project
                     if client.projectSessionIDs[project] == nil { refresh(project) }
-                } else {
-                    workspace.expandedProjects.remove(project)
                 }
             }
         )
@@ -870,8 +892,13 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 workspace.addedProjects = paths.map { ACPProject(path: $0) }
                 workspace.defaultProject = project
                 workspace.activeProject = project
-                workspace.expandedProjects = [project]
-                try await client.listSessions(in: project)
+                workspace.projectSectionExpanded = UserDefaults.standard.object(forKey: "acpProjectSectionExpanded." + client.address) as? Bool ?? true
+                workspace.expandedProjects = SidebarExpansion.restore(server: client.address, projects: projects, defaultProject: project)
+                for visible in projects where workspace.expandedProjects.contains(visible) {
+                    guard client.connected else { return }
+                    do { try await client.listSessions(in: visible) }
+                    catch { if client.connected { workspace.failure = error.localizedDescription } }
+                }
             }
         } label: {
             Label("连接", systemImage: "arrow.right")
@@ -895,18 +922,24 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 saveProjects()
             }
             workspace.activeProject = project
-            workspace.expandedProjects.insert(project)
+            setProject(project, expanded: true)
         }
     }
 
     private func removeProject(_ project: ACPProject) {
         workspace.addedProjects.removeAll { $0 == project }
-        workspace.expandedProjects.remove(project)
+        setProject(project, expanded: false)
         if workspace.activeProject == project { workspace.activeProject = workspace.defaultProject }
         if let selection = workspace.selection, client.projectSessionIDs[project]?.contains(selection) == true {
             workspace.selection = nil
         }
         saveProjects()
+    }
+
+    private func setProject(_ project: ACPProject, expanded: Bool) {
+        if expanded { workspace.expandedProjects.insert(project) }
+        else { workspace.expandedProjects.remove(project) }
+        SidebarExpansion.save(workspace.expandedProjects, server: client.address)
     }
 
     private func saveProjects() {
@@ -919,7 +952,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         manage {
             let id = try await client.createSession(in: project)
             workspace.activeProject = project
-            workspace.expandedProjects.insert(project)
+            setProject(project, expanded: true)
             workspace.selection = id
             workspace.preferredColumn = .detail
         }

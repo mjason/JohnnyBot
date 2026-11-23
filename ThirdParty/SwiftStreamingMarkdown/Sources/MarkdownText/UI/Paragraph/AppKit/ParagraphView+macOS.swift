@@ -55,6 +55,10 @@ struct ParagraphView: NSViewRepresentable {
       return nil
     }
 
+    // SwiftUI can measure the next snapshot before updating the native text view.
+    if nsView.paragraphContents != contents || nsView.lineSpacing != lineSpacing {
+      nsView.setParagraphContents(contents, lineSpacing: lineSpacing, animatedByWord: false)
+    }
     if contents != context.coordinator.lastContents || lineSpacing != context.coordinator.lastLineSpacing {
       context.coordinator.sizeCache.removeAll()
       context.coordinator.lastContents = contents

@@ -378,20 +378,13 @@ private struct TranscriptMarkdown: View {
     let text: String
     let isStreaming: Bool
 
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ScaledMetric(relativeTo: .body) private var textSize = ConversationLayout.transcriptTextSize
 
     private static let defaultConfig = makeConfig(textSize: ConversationLayout.transcriptTextSize)
 
     var body: some View {
         let base = textSize == ConversationLayout.transcriptTextSize ? Self.defaultConfig : Self.makeConfig(textSize: textSize)
-        Group {
-            if isStreaming {
-                LiveTranscriptMarkdown(text: text, config: base.withShouldAnimateText(value: !reduceMotion))
-            } else {
-                HistoricalTranscriptMarkdown(entryID: entryID, text: text, textSize: textSize, config: base)
-            }
-        }
+        TranscriptMarkdownDocument(entryID: entryID, text: text, textSize: textSize, isStreaming: isStreaming, config: base)
         .id(textSize)
         .textSelection(.enabled)
         .environment(\.openURL, OpenURLAction { url in
@@ -457,36 +450,57 @@ private struct TranscriptMarkdown: View {
     }
 }
 
-private struct HistoricalTranscriptMarkdown: View {
+private struct TranscriptMarkdownDocument: View {
     let entryID: UUID
     let text: String
     let textSize: CGFloat
+    let isStreaming: Bool
     let config: MarkdownRenderConfig
+
+    private struct Snapshot: Equatable {
+        let text: String
+        let isStreaming: Bool
+    }
 
     @Environment(\.transcriptMarkdownCache) private var cache
     @State private var parsed: (text: String, document: RenderableDocument)?
-
-    private var document: RenderableDocument? {
-        cache?.document(for: entryID, text: text, size: textSize)
-            ?? (parsed?.text == text ? parsed?.document : nil)
-    }
+    @State private var updates: AsyncStream<Snapshot>.Continuation?
 
     var body: some View {
-        Group {
-            if let document {
+        let snapshot = Snapshot(text: text, isStreaming: isStreaming)
+        let cached = cache?.document(for: entryID, text: text, size: textSize)
+        VStack(alignment: .leading, spacing: 0) {
+            if let document = parsed?.document ?? cached {
                 DocumentView(renderableDocument: document, config: config)
-            } else {
+            } else if !isStreaming {
                 Text(verbatim: text)
                     .font(.system(size: textSize))
                     .lineSpacing(3)
             }
         }
-        .task(id: text) {
-            guard document == nil else { return }
-            let document = await MarkdownParserImpl().parse(text: text, config: config)
-            guard !Task.isCancelled else { return }
-            cache?.store(document, for: entryID, text: text, size: textSize)
-            parsed = (text, document)
+        .onChange(of: snapshot) { _, next in updates?.yield(next) }
+        .task {
+            let (stream, continuation) = AsyncStream.makeStream(of: Snapshot.self, bufferingPolicy: .bufferingNewest(1))
+            updates = continuation
+            defer { continuation.finish() }
+            continuation.yield(snapshot)
+            let parser = MarkdownParserImpl()
+            for await next in stream {
+                guard !Task.isCancelled else { break }
+                let document: RenderableDocument
+                if let parsed, parsed.text == next.text {
+                    document = parsed.document
+                } else if let cached = cache?.document(for: entryID, text: next.text, size: textSize) {
+                    document = cached
+                } else {
+                    document = await parser.parse(text: next.text, config: config)
+                }
+                guard !Task.isCancelled else { break }
+                parsed = (next.text, document)
+                if !next.isStreaming {
+                    cache?.store(document, for: entryID, text: next.text, size: textSize)
+                }
+            }
         }
     }
 }
@@ -527,37 +541,6 @@ private final class TranscriptMarkdownCache {
 
 private extension EnvironmentValues {
     @Entry var transcriptMarkdownCache: TranscriptMarkdownCache?
-}
-
-private struct LiveTranscriptMarkdown: View {
-    let text: String
-    let config: MarkdownRenderConfig
-
-    @State private var source: TranscriptMarkdownSource?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if let source {
-                StreamedMarkdownView(source: source, config: config)
-            }
-        }
-        .onAppear { source = TranscriptMarkdownSource(text) }
-        .onChange(of: text) { _, value in source?.continuation.yield(value) }
-        .onDisappear {
-            source?.continuation.finish()
-            source = nil
-        }
-    }
-}
-
-private nonisolated struct TranscriptMarkdownSource: StreamedMarkdownSource {
-    let text: AsyncStream<String>
-    let continuation: AsyncStream<String>.Continuation
-
-    init(_ initialText: String) {
-        (text, continuation) = AsyncStream.makeStream(of: String.self, bufferingPolicy: .bufferingNewest(1))
-        continuation.yield(initialText)
-    }
 }
 
 private struct TranscriptPermissions: View {

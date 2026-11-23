@@ -5,6 +5,7 @@
 //  Created by 林满佳 on 2026/11/22.
 //
 
+import Foundation
 import Testing
 @testable import JohnnyBot
 #if os(macOS)
@@ -13,6 +14,23 @@ import AppKit
 
 @MainActor
 struct JohnnyBotTests {
+    @Test func restoresEachServersExpandedFoldersIncludingAnEmptySelection() throws {
+        let suite = UUID().uuidString
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let root = ACPProject(path: nil)
+        let folder = ACPProject(path: "/work/project")
+        func restore(_ server: String) -> Set<ACPProject> {
+            SidebarExpansion.restore(server: server, projects: [root, folder], defaultProject: root, defaults: defaults)
+        }
+        #expect(restore("A") == [root])
+        SidebarExpansion.save([folder, ACPProject(path: "/removed")], server: "A", defaults: defaults)
+        #expect(restore("A") == [folder])
+        #expect(restore("B") == [root])
+        SidebarExpansion.save([], server: "A", defaults: defaults)
+        #expect(restore("A").isEmpty)
+    }
+
     @Test func remembersServerTokensIndependentlyAcrossClientInstances() throws {
         let first = "wss://test.invalid/" + UUID().uuidString
         let second = first + "/other"
