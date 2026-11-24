@@ -79,6 +79,9 @@ struct SessionTranscript: View {
         .environment(\.transcriptMarkdownCache, markdownCache)
         .scrollPosition($position)
         .defaultScrollAnchor(.bottom)
+#if os(iOS)
+        .defaultScrollAnchor(.top, for: .alignment)
+#endif
         .onChange(of: turns.count) { previousCount, count in
             if count > previousCount, turns.last?.user != nil {
                 position.scrollTo(edge: .bottom)
@@ -90,6 +93,9 @@ struct SessionTranscript: View {
             showsJumpToLatest = awayFromBottom
         }
         .scrollEdgeEffectStyle(.soft, for: .bottom)
+#if os(iOS)
+        .scrollDismissesKeyboard(.interactively)
+#else
         .safeAreaBar(edge: .bottom, spacing: 0) {
             if permissions.isEmpty {
                 Color.clear
@@ -98,6 +104,7 @@ struct SessionTranscript: View {
                     .accessibilityHidden(true)
             }
         }
+#endif
         .overlay {
             if turns.isEmpty, !isResponding {
                 ContentUnavailableView("开始对话", systemImage: "text.bubble",

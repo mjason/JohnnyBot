@@ -29,6 +29,16 @@ struct SessionComposer: View {
     @State private var photo: PhotosPickerItem?
 #endif
 
+#if os(iOS)
+    private let actionSize = CGSize(width: 44, height: 44)
+    private let attachmentSize = CGSize(width: 44, height: 44)
+    private let bottomInset: CGFloat = 6
+#else
+    private let actionSize = CGSize(width: 34, height: 36)
+    private let attachmentSize = CGSize(width: 30, height: 32)
+    private let bottomInset: CGFloat = 16
+#endif
+
     private var canAttach: Bool { supportsImages || supportsFiles }
 
     private var canSend: Bool {
@@ -105,7 +115,7 @@ struct SessionComposer: View {
         }
         .frame(maxWidth: ConversationLayout.maxContentWidth)
         .padding(.horizontal, horizontalMargin)
-        .padding(.bottom, 16)
+        .padding(.bottom, bottomInset)
         .fileImporter(isPresented: $choosingFiles, allowedContentTypes: supportsFiles ? [.item] : [.image],
                       allowsMultipleSelection: true) { result in
             switch result {
@@ -154,7 +164,11 @@ struct SessionComposer: View {
                     .buttonStyle(ComposerSendStyle())
                     .accessibilityLabel("发送")
                     .keyboardShortcut(.return, modifiers: .command)
+#if os(iOS)
+                    .help("发送消息")
+#else
                     .help("发送消息（↩），换行（⇧↩）")
+#endif
                     .disabled(isManaging)
             } else {
                 Button {
@@ -165,7 +179,7 @@ struct SessionComposer: View {
                     Text("/")
                         .font(.system(.callout, design: .monospaced).weight(.semibold))
                         .foregroundStyle(.secondary)
-                        .frame(width: 34, height: 36)
+                        .frame(width: actionSize.width, height: actionSize.height)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -207,7 +221,7 @@ struct SessionComposer: View {
             Image(systemName: "plus")
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(.secondary)
-                .frame(width: 30, height: 32)
+                .frame(width: attachmentSize.width, height: attachmentSize.height)
                 .contentShape(Rectangle())
         }
 #if os(macOS)
@@ -220,17 +234,26 @@ struct SessionComposer: View {
     }
 
     private var input: some View {
-        TextField("向 Agent 发送消息", text: $draft,
-                  prompt: Text("向 Agent 发送消息").foregroundStyle(.primary.opacity(0.28)), axis: .vertical)
+#if os(iOS)
+        let prompt = Text("向 Agent 发送消息").foregroundStyle(.secondary)
+#else
+        let prompt = Text("向 Agent 发送消息").foregroundStyle(.primary.opacity(0.28))
+#endif
+        return TextField("向 Agent 发送消息", text: $draft, prompt: prompt, axis: .vertical)
             .focused($focused)
             .lineLimit(1...6)
             .fixedSize(horizontal: false, vertical: true)
             .textFieldStyle(.plain)
+#if os(iOS)
+            .font(.body)
+            .accessibilityLabel("消息输入框")
+#else
             .font(.system(size: 14, weight: .medium))
+#endif
             .padding(.vertical, 10)
 #if os(macOS)
             .onKeyPress(keys: [.return, .tab, .upArrow, .downArrow, .escape, "v"], phases: .down, action: handleKey)
-#else
+#elseif !os(iOS)
             .submitLabel(.send)
             .onSubmit { send() }
 #endif
@@ -377,7 +400,8 @@ struct SessionComposer: View {
                     Color(red: 0.74, green: 0.53, blue: 0.34),
                     Color(red: 0.80, green: 0.47, blue: 0.56)
                 ], startPoint: .leading, endPoint: .trailing))
-            .frame(width: 34, height: 36)
+            .frame(width: actionSize.width, height: actionSize.height)
+            .contentShape(Rectangle())
     }
 }
 

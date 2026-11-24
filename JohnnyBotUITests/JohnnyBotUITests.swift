@@ -33,6 +33,30 @@ final class JohnnyBotUITests: XCTestCase {
         // https://developer.apple.com/documentation/xcuiautomation
     }
 
+#if os(iOS)
+    @MainActor
+    func testPhoneConnectionRequiresAddressAndToken() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["-acpServerAddresses", "()"]
+        app.launch()
+
+        let connect = app.buttons["连接服务器"]
+        XCTAssertTrue(connect.waitForExistence(timeout: 5))
+        XCTAssertFalse(connect.isEnabled)
+        let address = app.textFields["服务器地址"]
+        address.tap()
+        address.typeText("ws://example.invalid/acp\n")
+        XCTAssertFalse(connect.isEnabled)
+        app.secureTextFields.firstMatch.typeText("test-token")
+        XCTAssertTrue(connect.isEnabled)
+        let keyboard = app.keyboards.firstMatch
+        XCTAssertTrue(keyboard.exists)
+        app.staticTexts["填写设备可以访问的 ACP 服务器地址。"].tap()
+        XCTAssertTrue(keyboard.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(connect.isEnabled)
+    }
+#endif
+
     @MainActor
     func testLaunchPerformance() throws {
         // This measures how long it takes to launch your application.

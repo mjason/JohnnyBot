@@ -64,6 +64,57 @@ struct RemoteDirectoryPicker: View {
         }
         .frame(width: 820, height: 460)
         .task(id: request) { await readDirectory() }
+#elseif os(iOS)
+        NavigationStack {
+            List {
+                Section {
+                    if let parent = listing?.parent {
+                        Button("上一级目录", systemImage: "arrow.up") { navigate(.visit(parent)) }
+                            .disabled(loading)
+                    }
+                    ForEach(visibleDirectories) { directory in
+                        Button {
+                            navigate(.visit(directory.path))
+                        } label: {
+                            HStack {
+                                Label(directory.name, systemImage: "folder")
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                            }
+                        }
+                        .disabled(loading)
+                    }
+                } header: {
+                    Text(listing?.path ?? defaultPath ?? "远程目录")
+                        .textCase(nil)
+                }
+                if loading {
+                    ProgressView("正在读取目录…")
+                } else if let failure {
+                    Section {
+                        Text(failure)
+                        Button("重试") { navigate(request.navigation) }
+                    }
+                } else if visibleDirectories.isEmpty {
+                    Text(search.isEmpty ? "此目录没有子文件夹" : "没有匹配的文件夹").foregroundStyle(.secondary)
+                }
+            }
+            .searchable(text: $search, prompt: "搜索当前目录")
+            .navigationTitle("添加项目")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("选取") {
+                        guard let chosenPath else { return }
+                        dismiss()
+                        select(chosenPath)
+                    }
+                    .disabled(loading || chosenPath == nil || failure != nil)
+                }
+            }
+        }
+        .task(id: request) { await readDirectory() }
 #else
         content.task(id: request) { await readDirectory() }
 #endif

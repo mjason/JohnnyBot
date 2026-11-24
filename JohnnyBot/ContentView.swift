@@ -43,19 +43,7 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-#if os(iOS)
-            GlassEffectContainer(spacing: 4) {
-                HStack(spacing: 8) {
-                    serverTabs
-                        .glassEffect(.regular, in: .capsule)
-                    newTabButton
-                        .buttonStyle(.glass)
-                        .buttonBorderShape(.circle)
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 4)
-#elseif !os(macOS)
+#if !os(iOS) && !os(macOS)
             HStack(spacing: 8) {
                 serverTabs
                 newTabButton
@@ -73,6 +61,8 @@ struct ContentView: View {
 #if os(macOS)
                 serverTabs
                     .frame(width: min(CGFloat(servers.count) * 180, max(132, windowWidth * 0.4)), height: 32)
+#elseif os(iOS)
+                serverMenu
 #endif
             } trailingAction: {
                 newTabButton
@@ -102,6 +92,36 @@ struct ContentView: View {
             }
         }
     }
+
+#if os(iOS)
+    private var serverMenu: some View {
+        Menu {
+            Picker("当前服务器", selection: Binding(get: { current.id }, set: { selectedServer = $0 })) {
+                ForEach(servers) { server in
+                    let pending = server.client.permissions.count
+                    Text(pending == 0 ? server.client.displayName : "\(server.client.displayName) · \(pending) 项待审批")
+                        .tag(server.id)
+                }
+            }
+            .pickerStyle(.inline)
+            Button("添加服务器", systemImage: "plus", action: addServer)
+            if current.client.connected {
+                Button("断开连接", systemImage: "power", role: .destructive) {
+                    UserDefaults.standard.set(true, forKey: "acpManuallyDisconnected." + current.client.address)
+                    current.client.disconnect()
+                }
+            }
+            if servers.count > 1 || !current.client.address.isEmpty {
+                Button("移除服务器", systemImage: "trash", role: .destructive) {
+                    requestClose(current, confirmRemoval: true)
+                }
+            }
+        } label: {
+            Label("切换服务器", systemImage: "server.rack")
+        }
+        .accessibilityValue(current.client.displayName)
+    }
+#endif
 
     private var newTabButton: some View {
         Button(action: addServer) {
@@ -151,11 +171,7 @@ struct ContentView: View {
         let showsClose = selected
 #endif
         let pending = server.client.permissions.count
-        let address = URLComponents(string: server.client.address)
-        let host = address?.host.map { host in
-            address?.port.map { "\(host):\($0)" } ?? host
-        }
-        let title = host ?? server.label
+        let title = server.client.displayName
 
         return HStack(spacing: 0) {
             if servers.count > 1 {
@@ -292,8 +308,13 @@ private final class ServerWorkspaceState {
     var tokenBelongsToAddress = false
     var resumeConnection = false
     var managing = false
+    var reconnectWhenIdle = false
     var failure: String?
+#if os(iOS)
+    var preferredColumn: NavigationSplitViewColumn = .sidebar
+#else
     var preferredColumn: NavigationSplitViewColumn = .detail
+#endif
 }
 
 private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
@@ -323,8 +344,55 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
     @State private var hoveredSession: String?
     @State private var sessionToDelete: ACPSession?
 
-    var body: some View {
+#if os(iOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    private enum ConnectionField { case address, token }
+    @FocusState private var connectionFocus: ConnectionField?
+#endif
+
+    @ViewBuilder private var workspaceContent: some View {
+#if os(iOS)
+        if client.connected {
+            if horizontalSizeClass == .compact {
+                NavigationStack(path: phonePath) {
+                    projectSidebar(selection: nil)
+                        .navigationDestination(for: String.self) { id in
+                            if let session = client.sessions.first(where: { $0.id == id }) {
+                                conversation(session)
+                            }
+                        }
+                }
+            } else {
+                workspaceLayout
+            }
+        } else {
+            NavigationStack {
+                connection
+                    .toolbar { ToolbarItem(placement: .topBarTrailing) { header() } }
+            }
+        }
+#else
         workspaceLayout
+#endif
+    }
+
+#if os(iOS)
+    private var phonePath: Binding<[String]> {
+        Binding {
+            workspace.selection.map { [$0] } ?? []
+        } set: { path in
+            guard client.connected, scenePhase == .active, workspace.selection != path.last else { return }
+            if let id = path.last {
+                workspace.selection = id
+            } else {
+                forgetSelection()
+            }
+        }
+    }
+#endif
+
+    var body: some View {
+        workspaceContent
         .confirmationDialog(
             "删除会话？",
             isPresented: Binding(get: { sessionToDelete != nil }, set: { if !$0 { sessionToDelete = nil } }),
@@ -391,7 +459,10 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
             workspace.sessionLoadFailure = nil
             if let id, let project = projects.first(where: { client.projectSessionIDs[$0]?.contains(id) == true }) {
                 workspace.activeProject = project
-                UserDefaults.standard.set(["id": id, "project": project.id], forKey: "acpLastSession." + client.address)
+                if let session = client.sessions.first(where: { $0.id == id }) {
+                    let location = ["id": id, "project": project.id, "title": session.title, "cwd": session.cwd]
+                    UserDefaults.standard.set(location, forKey: "acpLastSession." + client.address)
+                }
             }
             openSelectedSession()
         }
@@ -403,7 +474,12 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         }
 #endif
         .onChange(of: workspace.managing) { _, managing in
-            if !managing { openSelectedSession() }
+            guard !managing else { return }
+            if workspace.reconnectWhenIdle {
+                workspace.reconnectWhenIdle = false
+                if scenePhase == .active { reconnectIfNeeded() }
+            }
+            openSelectedSession()
         }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.data]) { result in
             do {
@@ -420,6 +496,10 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         }
         .onChange(of: client.connected) { _, connected in
             if !connected {
+#if os(iOS)
+                workspace.preferredColumn = .sidebar
+                terminalSession = nil
+#endif
                 choosingProject = false
                 sessionToRename = nil
                 workspace.selection = nil
@@ -433,104 +513,154 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         }
     }
 
-    private var workspaceLayout: some View {
-        NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $workspace.preferredColumn) {
-            List(selection: $workspace.selection) {
-                Section("项目", isExpanded: Binding(
-                    get: { workspace.projectSectionExpanded },
-                    set: { expanded in
-                        workspace.projectSectionExpanded = expanded
-                        if client.connected {
-                            UserDefaults.standard.set(expanded, forKey: "acpProjectSectionExpanded." + client.address)
-                        }
-                    }
-                )) {
-                    if projects.isEmpty {
-                        Text(client.connected ? "正在加载项目…" : "连接服务器后显示项目")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
-                    ForEach(projects) { project in
-                        projectRow(project)
+    private func projectSidebar(selection: Binding<String?>?) -> some View {
+        List(selection: selection) {
+            Section("项目", isExpanded: Binding(
+                get: { workspace.projectSectionExpanded },
+                set: { expanded in
+                    workspace.projectSectionExpanded = expanded
+                    if client.connected {
+                        UserDefaults.standard.set(expanded, forKey: "acpProjectSectionExpanded." + client.address)
                     }
                 }
+            )) {
+                if projects.isEmpty {
+                    Text(client.connected ? "正在加载项目…" : "连接服务器后显示项目")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(projects) { project in
+                    projectRow(project)
+                }
             }
+        }
 #if os(macOS)
-            .toolbar(removing: .sidebarToggle)
+        .toolbar(removing: .sidebarToggle)
 #endif
-            .listStyle(.sidebar)
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                if client.connected {
-                    HStack {
-                        Button {
-                            if let project = workspace.activeProject { createSession(in: project) }
-                        } label: {
-                            Label("新建会话", systemImage: "square.and.pencil")
-                        }
-                        .help(workspace.activeProject.map { "在「\($0.name)」中创建会话" } ?? "新建会话")
-                        .disabled(workspace.activeProject == nil)
-                        Spacer()
+        .listStyle(.sidebar)
+#if os(iOS)
+        .navigationTitle("会话")
+        .navigationSubtitle(client.displayName)
+        .refreshable {
+            guard client.supportsSessionList, !workspace.managing, let project = workspace.activeProject else { return }
+            do { try await client.listSessions(in: project) }
+            catch { if client.connected && !Task.isCancelled { workspace.failure = error.localizedDescription } }
+        }
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) { header() }
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if client.supportsDirectoryListing || client.supportsRemoteShell || client.supportsSessionList {
+                    Menu {
                         if client.supportsDirectoryListing {
-                            Button { choosingProject = true } label: {
-                                Label("添加项目", systemImage: "folder.badge.plus").labelStyle(.iconOnly)
-                            }
-                            .help("添加远程项目")
+                            Button("添加项目", systemImage: "folder.badge.plus") { choosingProject = true }
                         }
-                        if client.supportsSessionList {
-                            Button {
-                                if let project = workspace.activeProject { refresh(project) }
-                            } label: {
-                                Label("刷新会话", systemImage: "arrow.clockwise").labelStyle(.iconOnly)
+                        if let project = workspace.activeProject {
+                            if client.supportsSessionList {
+                                Button("刷新会话", systemImage: "arrow.clockwise") { refresh(project) }
                             }
-                            .help("刷新当前项目的会话")
-                            .disabled(workspace.activeProject == nil)
+                            if client.supportsRemoteShell {
+                                Button("远程终端", systemImage: "terminal") { openTerminal(project) }
+                            }
                         }
-                    }
-                    .buttonStyle(.borderless)
+                    } label: { Label("项目操作", systemImage: "ellipsis") }
                     .disabled(workspace.managing)
-#if os(macOS)
-                    .padding(.leading, 16)
-                    .padding(.trailing, 8.5)
-#else
-                    .padding(.horizontal, 16)
-#endif
-                    .padding(.vertical, 10)
                 }
-            }
-#if !os(macOS)
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                if client.connected {
-                    serverBar
-                }
-                if !client.connected {
+                if projects.count > 1 {
+                    Menu {
+                        Section("选择项目") {
+                            ForEach(projects) { project in
+                                Button(project.name) { createSession(in: project) }
+                            }
+                        }
+                    } label: { Label("新建会话", systemImage: "square.and.pencil") }
+                    .disabled(workspace.managing)
+                } else {
                     Button {
-                        workspace.preferredColumn = .detail
-                    } label: {
-                        Label("连接 Agent", systemImage: "network")
-                    }
-                    .buttonStyle(.bordered)
-                    .buttonBorderShape(.capsule)
-                    .padding()
+                        if let project = projects.first { createSession(in: project) }
+                    } label: { Label("新建会话", systemImage: "square.and.pencil") }
+                    .disabled(projects.isEmpty || workspace.managing)
                 }
             }
+        }
+#else
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if client.connected {
+                HStack {
+                    Button {
+                        if let project = workspace.activeProject { createSession(in: project) }
+                    } label: {
+                        Label("新建会话", systemImage: "square.and.pencil")
+                    }
+                    .help(workspace.activeProject.map { "在「\($0.name)」中创建会话" } ?? "新建会话")
+                    .disabled(workspace.activeProject == nil)
+                    Spacer()
+                    if client.supportsDirectoryListing {
+                        Button { choosingProject = true } label: {
+                            Label("添加项目", systemImage: "folder.badge.plus").labelStyle(.iconOnly)
+                        }
+                        .help("添加远程项目")
+                    }
+                    if client.supportsSessionList {
+                        Button {
+                            if let project = workspace.activeProject { refresh(project) }
+                        } label: {
+                            Label("刷新会话", systemImage: "arrow.clockwise").labelStyle(.iconOnly)
+                        }
+                        .help("刷新当前项目的会话")
+                        .disabled(workspace.activeProject == nil)
+                    }
+                }
+                .buttonStyle(.borderless)
+                .disabled(workspace.managing)
+#if os(macOS)
+                .padding(.leading, 16)
+                .padding(.trailing, 8.5)
+#else
+                .padding(.horizontal, 16)
+#endif
+                .padding(.vertical, 10)
+            }
+        }
+#if !os(macOS)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if client.connected {
+                serverBar
+            }
+            if !client.connected {
+                Button {
+                    workspace.preferredColumn = .detail
+                } label: {
+                    Label("连接 Agent", systemImage: "network")
+                }
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
+                .padding()
+            }
+        }
 
 #endif
 #if os(macOS)
-            .modifier(FloatingSidebar())
-            .navigationSplitViewColumnWidth(min: 220, ideal: 268, max: 340)
+        .modifier(FloatingSidebar())
+        .navigationSplitViewColumnWidth(min: 220, ideal: 268, max: 340)
 #endif
-            .navigationTitle("JohnnyBot")
-            .toolbar {
+        .navigationTitle("JohnnyBot")
+        .toolbar {
 #if os(macOS)
-                if columns != .detailOnly {
-                    ToolbarSpacer(.flexible, placement: .primaryAction)
-                    ToolbarItem(placement: .primaryAction) {
-                        sidebarActions
-                    }
-                    .sharedBackgroundVisibility(.hidden)
+            if columns != .detailOnly {
+                ToolbarSpacer(.flexible, placement: .primaryAction)
+                ToolbarItem(placement: .primaryAction) {
+                    sidebarActions
                 }
-#endif
+                .sharedBackgroundVisibility(.hidden)
             }
+#endif
+        }
+#endif
+    }
+
+    private var workspaceLayout: some View {
+        NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $workspace.preferredColumn) {
+            projectSidebar(selection: $workspace.selection)
         } detail: {
             Group {
                 if let id = workspace.selection, let session = client.sessions.first(where: { $0.id == id }) {
@@ -548,6 +678,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+#if !os(iOS)
             .overlay(alignment: .bottomTrailing) {
                 if client.supportsRemoteShell, let project = workspace.activeProject {
                     terminalButton(project)
@@ -555,6 +686,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                         .padding(.bottom, 16)
                 }
             }
+#endif
 #if os(macOS)
             .toolbar {
                 ToolbarItem(placement: .principal) {
@@ -848,8 +980,69 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         .background(.bar)
     }
 
+    private var serverAddress: Binding<String> {
+        Binding(get: { client.address }, set: { address in
+            guard client.address != address else { return }
+            if workspace.tokenBelongsToAddress {
+                client.token = ""
+                workspace.tokenBelongsToAddress = false
+            }
+            workspace.resumeConnection = false
+            client.address = address
+        })
+    }
+
     private var connection: some View {
         @Bindable var client = client
+#if os(iOS)
+        let canConnect = !workspace.managing &&
+            !client.address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+            !client.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return Form {
+            Section {
+                TextField("ws://主机:端口/acp", text: serverAddress)
+                    .accessibilityLabel("服务器地址")
+                    .keyboardType(.URL)
+                    .focused($connectionFocus, equals: .address)
+                    .submitLabel(.next)
+                    .onSubmit { connectionFocus = .token }
+            } header: { Text("服务器地址") } footer: {
+                Text("填写设备可以访问的 ACP 服务器地址。")
+            }
+            Section("共享令牌") {
+                SecureField("输入令牌", text: $client.token)
+                    .focused($connectionFocus, equals: .token)
+                    .submitLabel(.go)
+                    .onSubmit {
+                        if canConnect { connectionFocus = nil; connect(automatic: false) }
+                    }
+                Button("从 .env 文件导入", systemImage: "arrow.down.doc") {
+                    connectionFocus = nil
+                    importing = true
+                }
+            }
+            Section {
+                Button {
+                    connectionFocus = nil
+                    connect(automatic: false)
+                } label: {
+                    HStack {
+                        Spacer()
+                        if workspace.managing { ProgressView() }
+                        Text(workspace.managing ? "正在连接…" : "连接服务器").fontWeight(.semibold)
+                        Spacer()
+                    }
+                }
+                .disabled(!canConnect)
+            }
+        }
+        .disabled(workspace.managing)
+        .textInputAutocapitalization(.never)
+        .autocorrectionDisabled()
+        .scrollDismissesKeyboard(.interactively)
+        .navigationTitle("连接服务器")
+        .gesture(DismissKeyboardOnOutsideTap())
+#else
         return ScrollView {
             VStack(spacing: 24) {
                 VStack(spacing: 11) {
@@ -867,14 +1060,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 }
                 VStack(alignment: .leading, spacing: 12) {
                     connectionField("服务器地址", icon: "server.rack") {
-                        TextField("ws:// 或 wss://", text: Binding(get: { client.address }, set: { address in
-                            if client.address != address && workspace.tokenBelongsToAddress {
-                                client.token = ""
-                                workspace.tokenBelongsToAddress = false
-                            }
-                            if client.address != address { workspace.resumeConnection = false }
-                            client.address = address
-                        }))
+                        TextField("ws:// 或 wss://", text: serverAddress)
                             .accessibilityLabel("服务器地址")
                     }
                     connectionField("共享令牌", icon: "key") {
@@ -901,6 +1087,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
             .containerRelativeFrame(.vertical) { height, _ in max(390, height) }
         }
         .navigationTitle("JohnnyBot")
+#endif
     }
 
     private func connectionField<Field: View>(_ title: String, icon: String, @ViewBuilder field: () -> Field) -> some View {
@@ -936,6 +1123,10 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
     private func reconnectIfNeeded() {
         guard !client.connected, !client.token.isEmpty, workspace.resumeConnection, workspace.tokenBelongsToAddress,
               !UserDefaults.standard.bool(forKey: "acpManuallyDisconnected." + client.address) else { return }
+        if workspace.managing {
+            workspace.reconnectWhenIdle = true
+            return
+        }
         connect(automatic: true)
     }
 
@@ -970,14 +1161,22 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 do {
                     try await client.listSessions(in: visible)
                     if visible == lastProject, let id = last?["id"], workspace.selection == initial,
-                       client.connected, client.supportsSessionList {
-                        if client.projectSessionIDs[visible]?.contains(id) == true {
-                            workspace.activeProject = visible
-                            workspace.selection = id
-                            workspace.preferredColumn = .detail
-                        } else {
-                            UserDefaults.standard.removeObject(forKey: key)
+                       client.connected {
+                        if client.projectSessionIDs[visible]?.contains(id) != true {
+#if os(iOS)
+                            guard client.supportsSessionLoad else { continue }
+                            let saved = ACPSession(id: id, title: last?["title"] ?? "上次会话",
+                                                   cwd: last?["cwd"] ?? visible.path ?? "")
+                            try await client.restoreUnlistedSession(saved, in: visible)
+                            guard workspace.selection == initial, client.connected else { continue }
+#else
+                            if client.supportsSessionList { UserDefaults.standard.removeObject(forKey: key) }
+                            continue
+#endif
                         }
+                        workspace.activeProject = visible
+                        workspace.selection = id
+                        workspace.preferredColumn = .detail
                     }
                 } catch { if client.connected { workspace.failure = error.localizedDescription } }
             }
@@ -985,6 +1184,9 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
     }
 
     private func forgetSelection() {
+#if os(iOS)
+        workspace.preferredColumn = .sidebar
+#endif
         UserDefaults.standard.removeObject(forKey: "acpLastSession." + client.address)
         workspace.selection = nil
     }
@@ -1062,9 +1264,13 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         let permissions = client.permissions.filter { $0.sessionID == id }
         let options = client.sessionOptions[id]
         let showsSettings = options?.config.map { !$0.isEmpty } ?? (options?.modes?.availableModes.isEmpty == false)
+#if os(iOS)
+        let horizontalMargin: CGFloat = 16
+#else
         let settingsMargin = showsSettings ? ConversationLayout.settingsGutter : 0
         let terminalMargin: CGFloat = client.supportsRemoteShell ? 46 : 0
         let horizontalMargin = ConversationLayout.horizontalMargin + settingsMargin + terminalMargin
+#endif
         return VStack(spacing: 0) {
             if isLoaded {
                 SessionTranscript(
@@ -1073,6 +1279,10 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 ) { permission, option in
                     run { try await client.respond(to: permission, option: option) }
                 }
+#if os(iOS)
+                .contentShape(Rectangle())
+                .gesture(DismissKeyboardOnOutsideTap())
+#endif
                 .modifier(ProjectLinkPreview(client: client, session: id))
                 .id(id)
 
@@ -1097,47 +1307,66 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                     )
                     .id(id)
                     .frame(maxWidth: .infinity)
+#if !os(iOS)
                     if showsSettings, let options {
                         sessionSettings(options, in: id)
                             .padding(.trailing, 20 + terminalMargin)
                             .padding(.bottom, 16)
                     }
+#endif
                 }
             } else {
                 sessionOpeningStatus(for: id)
             }
         }
         .navigationTitle(session.title)
+#if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+#endif
         .toolbar {
-            if isLoaded {
-                ToolbarItem {
-                    Button {
-                        manage {
-                            try await client.close(id)
-                            if workspace.selection == id { forgetSelection() }
+#if os(iOS)
+            if isLoaded || client.supportsRemoteShell {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        if isLoaded, showsSettings, let options { sessionSettings(options, in: id) }
+                        if client.supportsRemoteShell, let project = workspace.activeProject {
+                            Button("远程终端", systemImage: "terminal") { openTerminal(project) }
                         }
-                    } label: {
-                        Label("释放会话", systemImage: "rectangle.portrait.and.arrow.right")
-                    }
-                    .disabled(workspace.managing || isPrompting)
+                        if isLoaded { releaseButton(id) }
+                    } label: { Label("会话操作", systemImage: "ellipsis") }
                 }
             }
+#else
+            if isLoaded { ToolbarItem { releaseButton(id) } }
+#endif
+        }
+    }
+
+    private func releaseButton(_ id: String) -> some View {
+        Button("释放会话", systemImage: "rectangle.portrait.and.arrow.right") {
+            manage {
+                try await client.close(id)
+                if workspace.selection == id { forgetSelection() }
+            }
+        }
+        .disabled(workspace.managing || client.prompting.contains(id))
+    }
+
+    private func openTerminal(_ project: ACPProject) {
+        do {
+#if os(macOS)
+            try terminalWindows.select(client, project: project)
+            openWindow(id: "remote-terminal")
+#else
+            terminalSession = try terminalWindows.session(for: client, project: project)
+#endif
+        } catch {
+            workspace.failure = error.localizedDescription
         }
     }
 
     private func terminalButton(_ project: ACPProject) -> some View {
-        Button {
-            do {
-#if os(macOS)
-                try terminalWindows.select(client, project: project)
-                openWindow(id: "remote-terminal")
-#else
-                terminalSession = try terminalWindows.session(for: client, project: project)
-#endif
-            } catch {
-                workspace.failure = error.localizedDescription
-            }
-        } label: {
+        Button { openTerminal(project) } label: {
             Label("远程终端", systemImage: "terminal")
                 .labelStyle(.iconOnly)
                 .font(.system(size: 15, weight: .medium))
@@ -1274,9 +1503,13 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 }
             }
         } label: {
+#if os(iOS)
+            Label("会话设置", systemImage: "slider.horizontal.3")
+#else
             Image(systemName: "slider.horizontal.3")
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(.secondary)
+#endif
         }
 #if os(macOS)
         .menuStyle(.borderlessButton)

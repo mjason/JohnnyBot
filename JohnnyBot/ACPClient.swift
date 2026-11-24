@@ -150,11 +150,20 @@ final class ACPClient {
         var tools: [String: Int] = [:]
     }
 
-    static let defaultAddress = ProcessInfo.processInfo.environment["JOHNNY_ACP_URL"]
-        ?? "ws://127.0.0.1:8765/acp"
+#if os(iOS)
+    static let defaultAddress = ProcessInfo.processInfo.environment["JOHNNY_ACP_URL"] ?? ""
+#else
+    static let defaultAddress = ProcessInfo.processInfo.environment["JOHNNY_ACP_URL"] ?? "ws://127.0.0.1:8765/acp"
+#endif
 
     var address: String
     var token: String
+
+    var displayName: String {
+        let components = URLComponents(string: address)
+        guard let host = components?.host else { return address.isEmpty ? "新服务器" : address }
+        return components?.port.map { "\(host):\($0)" } ?? host
+    }
 
     init(address: String, token: String) {
         self.address = address
@@ -466,6 +475,19 @@ final class ACPClient {
             throw error
         }
     }
+
+#if os(iOS)
+    // A session can be loadable before the server includes it in session/list.
+    func restoreUnlistedSession(_ session: ACPSession, in project: ACPProject) async throws {
+        guard let connection = socket else { throw ACPFailure(message: "请先连接服务器") }
+        try await load(session)
+        guard socket === connection, loaded.contains(session.id) else { throw ACPFailure(message: "未能恢复会话") }
+        if !sessions.contains(where: { $0.id == session.id }) { sessions.append(session) }
+        if projectSessionIDs[project]?.contains(session.id) != true {
+            projectSessionIDs[project, default: []].append(session.id)
+        }
+    }
+#endif
 
     func close(_ id: String) async throws {
         _ = try await call("session/close", ["sessionId": id])

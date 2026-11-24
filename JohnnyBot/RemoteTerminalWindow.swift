@@ -105,13 +105,63 @@ struct RemoteTerminalWindow: View {
     }
 
     var body: some View {
+#if os(iOS)
+        NavigationStack {
+            terminalContent
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) { Button("完成") { dismiss() } }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Menu {
+                            Section("终端标签") {
+                                ForEach(shell.visibleTabs) { tab in
+                                    Button {
+                                        shell.selectTab(tab.id)
+                                    } label: {
+                                        if tab.id == shell.selectedTab { Label(tabLabel(tab), systemImage: "checkmark") }
+                                        else { Text(tabLabel(tab)) }
+                                    }
+                                    .disabled(!canChangeTabs)
+                                }
+                                Button("新建终端标签", systemImage: "plus", action: newTab)
+                                    .disabled(!canChangeTabs && shell.state != .empty)
+                                if let tab = shell.activeTab {
+                                    Button("关闭当前标签", systemImage: "xmark") { requestClose(tab) }
+                                        .disabled(!canChangeTabs)
+                                }
+                            }
+                            Button("终端设置", systemImage: "gearshape") { showingSettings = true }
+                        } label: { Label("终端操作", systemImage: "ellipsis") }
+                    }
+                }
+                .sheet(isPresented: $showingSettings) {
+                    NavigationStack {
+                        settings
+                            .navigationTitle("终端设置")
+                            .navigationBarTitleDisplayMode(.inline)
+                            .toolbar {
+                                ToolbarItem(placement: .confirmationAction) {
+                                    Button("完成") { showingSettings = false }
+                                }
+                            }
+                    }
+                }
+        }
+#else
+        terminalContent
+#endif
+    }
+
+    private var terminalContent: some View {
         VStack(spacing: 0) {
-#if !os(macOS)
+#if !os(macOS) && !os(iOS)
             header
             Divider()
 #endif
+#if !os(iOS)
             tabBar
             Divider()
+#endif
             ZStack {
                 let showsTerminal = shell.state == .attached && shell.activeTab != nil
                 TerminalSurface(shell: shell, appearance: appearance)
@@ -379,8 +429,10 @@ struct RemoteTerminalWindow: View {
             }
         }
         .controlSize(.large)
+#if !os(iOS)
         .padding(16)
         .frame(width: 330)
+#endif
     }
 
     private func tabShortcut(_ index: Int) -> KeyboardShortcut? {
