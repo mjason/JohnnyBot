@@ -50,7 +50,6 @@ struct JohnnyBotApp: App {
             ContentView()
                 .environment(terminals)
 #if os(macOS)
-                .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
                 .background(HideTitlebarSeparator())
 #endif
         }

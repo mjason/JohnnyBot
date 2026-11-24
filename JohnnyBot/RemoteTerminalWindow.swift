@@ -256,7 +256,11 @@ struct RemoteTerminalWindow: View {
                 }
             }
             .frame(height: tabHeight + 4)
-            .background(SwiftUI.Color.primary.opacity(colorScheme == .dark ? 0.15 : 0.10), in: Capsule())
+#if os(visionOS)
+            .background(.regularMaterial, in: Capsule())
+#else
+            .glassEffect(.regular, in: .capsule)
+#endif
             .clipShape(Capsule())
             .disabled(!canChangeTabs)
             Button(action: newTab) {
@@ -311,13 +315,7 @@ struct RemoteTerminalWindow: View {
             .font(.system(size: 12, weight: selected ? .medium : .regular))
             .padding(.horizontal, tabHeight + 4)
             .frame(width: width - 2, height: tabHeight)
-            .background {
-                if selected {
-                    Capsule()
-                        .fill(.background.opacity(colorScheme == .dark ? 0.65 : 0.82))
-                        .strokeBorder(.primary.opacity(0.07))
-                }
-            }
+            .workspaceTabHighlight(selected: selected, hovered: hoveredTab == tab.id)
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)

@@ -12,6 +12,7 @@ struct ContentView: View {
         }
     }
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var servers: [Server]
 
     init() {
@@ -42,7 +43,19 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-#if !os(macOS)
+#if os(iOS)
+            GlassEffectContainer(spacing: 4) {
+                HStack(spacing: 8) {
+                    serverTabs
+                        .glassEffect(.regular, in: .capsule)
+                    newTabButton
+                        .buttonStyle(.glass)
+                        .buttonBorderShape(.circle)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+#elseif !os(macOS)
             HStack(spacing: 8) {
                 serverTabs
                 newTabButton
@@ -59,7 +72,7 @@ struct ContentView: View {
             ) {
 #if os(macOS)
                 serverTabs
-                    .frame(width: min(920, max(132, windowWidth - 355)), height: 32)
+                    .frame(width: min(CGFloat(servers.count) * 180, max(132, windowWidth * 0.4)), height: 32)
 #endif
             } trailingAction: {
                 newTabButton
@@ -118,11 +131,10 @@ struct ContentView: View {
                 .containerRelativeFrame(.horizontal) { width, _ in
                     max(width, CGFloat(servers.count) * 132)
                 }
-                .background(.quaternary, in: Capsule())
             }
             .scrollIndicators(.hidden)
             .onChange(of: current.id, initial: true) { _, id in
-                withAnimation(.easeInOut(duration: 0.2)) {
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
                     proxy.scrollTo(id, anchor: .center)
                 }
             }
@@ -192,15 +204,7 @@ struct ContentView: View {
         }
         .font(.callout.weight(selected ? .semibold : .regular))
         .foregroundStyle(selected ? .primary : .secondary)
-        .background {
-            if selected {
-                Capsule()
-                    .fill(.background)
-                    .shadow(color: .black.opacity(0.10), radius: 1.5, y: 1)
-            } else if hoveredTab == server.id {
-                Capsule().fill(.primary.opacity(0.055))
-            }
-        }
+        .workspaceTabHighlight(selected: selected && servers.count > 1, hovered: hoveredTab == server.id)
         .contentShape(Capsule())
         .onHover { hovering in
             if hovering {
@@ -301,6 +305,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
     @ViewBuilder let trailingAction: () -> TrailingAction
     @State private var importing = false
     @State private var choosingProject = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var scenePhase
     @Environment(RemoteTerminalWindows.self) private var terminalWindows
 #if os(macOS)
@@ -483,7 +488,12 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                     }
                     .buttonStyle(.borderless)
                     .disabled(workspace.managing)
+#if os(macOS)
+                    .padding(.leading, 16)
+                    .padding(.trailing, 8.5)
+#else
                     .padding(.horizontal, 16)
+#endif
                     .padding(.vertical, 10)
                 }
             }
@@ -506,6 +516,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
 
 #endif
 #if os(macOS)
+            .modifier(FloatingSidebar())
             .navigationSplitViewColumnWidth(min: 220, ideal: 268, max: 340)
 #endif
             .navigationTitle("JohnnyBot")
@@ -516,6 +527,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                     ToolbarItem(placement: .primaryAction) {
                         sidebarActions
                     }
+                    .sharedBackgroundVisibility(.hidden)
                 }
 #endif
             }
@@ -555,7 +567,6 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
 #endif
         }
 #if os(macOS)
-        .scrollEdgeEffectHidden(true, for: .top)
         .toolbar {
             if columns == .detailOnly {
                 ToolbarItem(placement: .navigation) {
@@ -590,8 +601,43 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
     }
 
 #if os(macOS)
+    private struct FloatingSidebar: ViewModifier {
+        @ViewBuilder
+        func body(content: Content) -> some View {
+            if #available(macOS 27.0, *) {
+                // Tahoe draws its own floating sidebar. On newer systems the default is edge-to-edge.
+                let panel = RoundedRectangle(cornerRadius: 16, style: .continuous)
+                let inset: CGFloat = 8
+                content
+                    .scrollContentBackground(.hidden)
+                    .padding(.horizontal, inset)
+                    .padding(.bottom, inset)
+                    .background {
+                        Color.clear
+                            .glassEffect(.regular, in: panel)
+                            .padding(inset)
+                            .overlay {
+                                GeometryReader { geometry in
+                                    let bounds = CGRect(origin: .zero, size: geometry.size)
+                                    Path { path in
+                                        path.addRect(bounds)
+                                        path.addPath(panel.path(in: bounds.insetBy(dx: inset, dy: inset)))
+                                    }
+                                    .fill(.background, style: FillStyle(eoFill: true))
+                                }
+                            }
+                            .ignoresSafeArea(.container, edges: [.top, .bottom])
+                            .allowsHitTesting(false)
+                    }
+            } else {
+                content
+            }
+        }
+    }
+
     private var sidebarActions: some View {
-        HStack(spacing: 1) {
+        // Each 28 pt target adds 4.5 pt on either side of its 19 pt symbol.
+        HStack(alignment: .center, spacing: 11) {
             Button(action: removeServer) {
                 sidebarActionIcon("minus.rectangle")
             }
@@ -602,7 +648,8 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
             sidebarToggle(showing: true)
         }
         .buttonStyle(SidebarHoverStyle())
-        .padding(.horizontal, 3)
+        .padding(.leading, 3)
+        .padding(.trailing, 6)
     }
 
     private struct SidebarHoverStyle: ButtonStyle {
@@ -630,7 +677,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
             .resizable()
             .scaledToFit()
             .frame(width: 19, height: 15)
-            .frame(width: 32, height: 24)
+            .frame(width: 28, height: 28)
             .contentShape(Rectangle())
             .accessibilityHidden(true)
     }
@@ -638,7 +685,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
     private func sidebarToggle(showing: Bool) -> some View {
         let title = showing ? "隐藏边栏" : "显示边栏"
         return Button {
-            withAnimation(.easeInOut(duration: 0.22)) {
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.22)) {
                 columns = showing ? .detailOnly : .all
             }
         } label: {
@@ -818,7 +865,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                 }
-                VStack(alignment: .leading, spacing: 0) {
+                VStack(alignment: .leading, spacing: 12) {
                     connectionField("服务器地址", icon: "server.rack") {
                         TextField("ws:// 或 wss://", text: Binding(get: { client.address }, set: { address in
                             if client.address != address && workspace.tokenBelongsToAddress {
@@ -830,17 +877,14 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                         }))
                             .accessibilityLabel("服务器地址")
                     }
-                    Divider().padding(.leading, 42)
                     connectionField("共享令牌", icon: "key") {
                         SecureField("输入或导入令牌", text: $client.token)
                             .accessibilityLabel("共享令牌")
                     }
                 }
-                .textFieldStyle(.plain)
+                .textFieldStyle(.roundedBorder)
                 .disabled(workspace.managing)
                 .autocorrectionDisabled()
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
-                .overlay { RoundedRectangle(cornerRadius: 18).strokeBorder(.quaternary) }
                 ViewThatFits(in: .horizontal) {
                     HStack(spacing: 12) { connectionButtons }
                     VStack(spacing: 12) { connectionButtons }
@@ -870,7 +914,6 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 field()
             }
         }
-        .padding(14)
     }
 
     @ViewBuilder private var connectionButtons: some View {
@@ -1240,7 +1283,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         .menuIndicator(.hidden)
 #endif
         .frame(width: 32, height: 32)
-        .background(.quaternary.opacity(0.5), in: Circle())
+
         .accessibilityLabel("会话设置")
         .help("切换模型、推理强度和会话模式")
         .disabled(workspace.managing)

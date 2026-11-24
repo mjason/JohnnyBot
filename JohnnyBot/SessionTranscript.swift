@@ -89,9 +89,6 @@ struct SessionTranscript: View {
         } action: { _, awayFromBottom in
             showsJumpToLatest = awayFromBottom
         }
-#if os(macOS)
-        .scrollEdgeEffectHidden(true, for: .top)
-#endif
         .scrollEdgeEffectStyle(.soft, for: .bottom)
         .safeAreaBar(edge: .bottom, spacing: 0) {
             if permissions.isEmpty {
@@ -119,11 +116,14 @@ struct SessionTranscript: View {
             Label("回到最新消息", systemImage: "arrow.down")
                 .labelStyle(.iconOnly)
                 .font(.system(.callout, weight: .semibold))
-                .frame(width: 34, height: 34)
-                .contentShape(Circle())
-                .glassEffect(.regular.interactive(), in: .circle)
         }
-        .buttonStyle(.plain)
+#if os(visionOS)
+        .buttonStyle(.bordered)
+#else
+        .buttonStyle(.glass)
+#endif
+        .buttonBorderShape(.circle)
+        .controlSize(.large)
         .help("回到最新消息")
     }
 }
