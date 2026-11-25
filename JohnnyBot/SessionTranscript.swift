@@ -338,10 +338,7 @@ private struct TranscriptEntryRow: View {
                     AttachmentBadge(preview: attachment)
                 }
                 if !entry.text.isEmpty {
-                    Text(entry.text)
-                        .font(.system(size: textSize))
-                        .lineSpacing(3)
-                        .textSelection(.enabled)
+                    TranscriptPlainText(text: entry.text, size: textSize, lineSpacing: 3)
                         .padding(.horizontal, 13)
                         .padding(.vertical, 9)
                         .background(.primary.opacity(0.045), in: bubble)
@@ -353,6 +350,56 @@ private struct TranscriptEntryRow: View {
         }
     }
 }
+
+#if os(iOS)
+private struct TranscriptPlainText: UIViewRepresentable {
+    let text: String
+    let size: CGFloat
+    let lineSpacing: CGFloat
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = UITextView()
+        view.isEditable = false
+        view.isSelectable = true
+        view.isScrollEnabled = false
+        view.backgroundColor = .clear
+        view.textContainerInset = .zero
+        view.textContainer.lineFragmentPadding = 0
+        return view
+    }
+
+    func updateUIView(_ view: UITextView, context: Context) {
+        guard view.text != text || view.font?.pointSize != size else { return }
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = lineSpacing
+        view.attributedText = NSAttributedString(string: text, attributes: [
+            .font: UIFont.systemFont(ofSize: size), .foregroundColor: UIColor.label,
+            .paragraphStyle: paragraph
+        ])
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UITextView, context: Context) -> CGSize? {
+        guard let width = proposal.width, width > 0, width.isFinite else { return nil }
+        let fit = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
+        // Measure the unwrapped width independently of the previous layout pass.
+        let natural = uiView.attributedText.size().width.rounded(.up)
+        return CGSize(width: min(width, natural), height: ceil(fit.height))
+    }
+}
+#else
+private struct TranscriptPlainText: View {
+    let text: String
+    let size: CGFloat
+    let lineSpacing: CGFloat
+
+    var body: some View {
+        Text(verbatim: text)
+            .font(.system(size: size))
+            .lineSpacing(lineSpacing)
+            .textSelection(.enabled)
+    }
+}
+#endif
 
 private struct TranscriptMarkdown: View {
     let entryID: UUID
@@ -385,10 +432,7 @@ private struct TranscriptMarkdown: View {
 
     @ViewBuilder private var content: some View {
         if !isStreaming && !usedStreamingRenderer && Self.isPlainParagraph(text) {
-            Text(verbatim: text)
-                .font(.system(size: textSize))
-                .lineSpacing(5)
-                .textSelection(.enabled)
+            TranscriptPlainText(text: text, size: textSize, lineSpacing: 5)
         } else {
             TranscriptMarkdownDocument(entryID: entryID, text: text, textSize: textSize,
                                        isStreaming: isStreaming, config: Self.config(for: textSize))
