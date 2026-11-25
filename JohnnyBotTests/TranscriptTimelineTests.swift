@@ -1,22 +1,33 @@
+import Foundation
 import Testing
 @testable import JohnnyBot
 
 @MainActor
 struct TranscriptTimelineTests {
-    @Test func historyPagesCountEntriesAcrossTurnBoundaries() {
+    @Test func jumpButtonRequiresScrollingAwayFromLatest() {
+        var button = TranscriptJumpVisibility()
+        button.update(awayFromBottom: true, userScrolling: false)
+        #expect(!button.isVisible)
+        button.update(awayFromBottom: true, userScrolling: true)
+        button.update(awayFromBottom: true, userScrolling: false)
+        #expect(button.isVisible)
+        button.update(awayFromBottom: false, userScrolling: true)
+        button.update(awayFromBottom: true, userScrolling: false)
+        #expect(!button.isVisible)
+    }
+
+    @Test func longHistoryKeepsCompleteTurns() {
         let timeline = TranscriptTimeline()
         let history = (0..<253).map { i in
             ACPEntry(kind: i == 0 || i == 200 ? .user : .agent, text: String(i))
         }
         timeline.replace(history)
         #expect(timeline.entryCount == history.count)
-        for start in [153, 53, 0] {
-            let page = timeline.visibleRows(from: start).flatMap { row in
-                let turn = timeline.visibleTurn(row, from: start)
-                return [turn.user].compactMap { $0 } + Array(turn.entries)
-            }
-            #expect(page.map(\.id) == history[start...].map(\.id))
+        #expect(timeline.rows.count == 2)
+        let rendered = timeline.rows.flatMap { row in
+            [row.turn.user].compactMap { $0 } + Array(row.turn.entries)
         }
+        #expect(rendered.map(\.id) == history.map(\.id))
     }
 
     @Test func flushCombinesNewTurnsAndLateToolUpdates() {

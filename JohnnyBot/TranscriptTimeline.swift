@@ -75,16 +75,6 @@ final class TranscriptTimeline {
         // Only a row that enters the transcript window builds its grouped content.
         @ObservationIgnored private var historicalTurn: TranscriptTurn?
 
-        func suffix(skipping count: Int) -> TranscriptTurn {
-            if count <= 0 { return turn }
-            if current == nil, let history = historicalEntries, count < history.count {
-                return TranscriptTimeline.turn(history.dropFirst(count))
-            }
-            let full = turn
-            let skip = count - (full.user == nil ? 0 : 1)
-            return TranscriptTurn(user: nil, entries: full.entries.dropFirst(skip)) ?? full
-        }
-
         init(_ turn: TranscriptTurn, index: Int) {
             id = turn.id
             self.index = index
@@ -102,19 +92,7 @@ final class TranscriptTimeline {
     @ObservationIgnored private var rowForOffset: [Int] = []
     @ObservationIgnored private var starts: [Int] = []
 
-    static let pageSize = 100
-
     private(set) var entryCount = 0
-
-    func visibleRows(from offset: Int) -> ArraySlice<Row> {
-        guard rowForOffset.indices.contains(offset) else { return [] }
-        return rows[rowForOffset[offset]...]
-    }
-
-    func visibleTurn(_ row: Row, from offset: Int) -> TranscriptTurn {
-        guard starts.indices.contains(row.index) else { return row.turn }
-        return row.suffix(skipping: offset - starts[row.index])
-    }
 
     func replace(_ history: [ACPEntry]) {
         starts = history.indices.filter { $0 == 0 || history[$0].kind == .user }
@@ -151,7 +129,7 @@ final class TranscriptTimeline {
 
     func update(_ history: [ACPEntry], changedOffsets: Set<Int>) {
         defer { entryCount = history.count }
-        if rows.isEmpty, history.count > Self.pageSize { replace(history); return }
+        if rows.isEmpty { replace(history); return }
         if changedOffsets.count == 1, let offset = changedOffsets.first {
             update(history, at: offset)
             return

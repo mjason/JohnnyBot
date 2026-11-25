@@ -20,6 +20,18 @@ enum ConversationLayout {
 #endif
 }
 
+struct TranscriptJumpVisibility {
+    private(set) var isVisible = false
+
+    mutating func update(awayFromBottom: Bool, userScrolling: Bool) {
+        if !awayFromBottom {
+            isVisible = false
+        } else if userScrolling {
+            isVisible = true
+        }
+    }
+}
+
 struct SessionTranscript: View {
     let timeline: TranscriptTimeline
     let isResponding: Bool
@@ -29,9 +41,8 @@ struct SessionTranscript: View {
     let respondToPermission: (ACPPermission, String?) -> Void
 
     @State private var position = ScrollPosition(edge: .bottom)
-    @State private var historyStart: Int?
-    @State private var showsJumpToLatest = false
-    @ScaledMetric(relativeTo: .body) private var textSize = ConversationLayout.transcriptTextSize
+    @State private var jumpVisibility = TranscriptJumpVisibility()
+    @State private var userScrolling = false
     @State private var markdownCache = TranscriptMarkdownCache()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -66,7 +77,7 @@ struct SessionTranscript: View {
             }
         }
         .overlay(alignment: .bottom) {
-            if showsJumpToLatest {
+            if jumpVisibility.isVisible {
                 jumpButton
                     .padding(.bottom, 10)
             }
@@ -84,26 +95,11 @@ struct SessionTranscript: View {
     }
 
     private func messageScrollView(minHeight: CGFloat) -> some View {
-        let start = min(historyStart ?? max(0, timeline.entryCount - TranscriptTimeline.pageSize),
-                        max(0, timeline.entryCount - 1))
-        let visible = timeline.visibleRows(from: start)
-        return ScrollView {
+        ScrollView {
             LazyVStack(alignment: .leading, spacing: 18) {
-                if start > 0 {
-                    Button("加载更早的消息") {
-                        historyStart = max(0, start - TranscriptTimeline.pageSize)
-                    }
-                    .buttonStyle(.borderless)
-                    .frame(maxWidth: .infinity)
-                }
-                ForEach(visible) { row in
-                    TranscriptTurnRow(
-                        row: row, timeline: timeline, start: start, isLive: isResponding && row.id == timeline.rows.last?.id,
-                        isAwaitingPermission: !permissions.isEmpty
-                    )
-                    .onAppear {
-                        markdownCache.prefetch(around: row.index, in: timeline, from: start, size: textSize, streaming: isResponding)
-                    }
+                ForEach(timeline.rows) { row in
+                    TranscriptTurnRow(row: row, isLive: isResponding && row.id == timeline.rows.last?.id,
+                                      isAwaitingPermission: !permissions.isEmpty)
                 }
             }
             .frame(maxWidth: ConversationLayout.maxContentWidth)
@@ -120,16 +116,23 @@ struct SessionTranscript: View {
 #if os(macOS)
         .scrollBounceBehavior(.basedOnSize, axes: .vertical)
 #endif
+        .onScrollPhaseChange { previous, phase, context in
+            userScrolling = phase == .interacting || phase == .decelerating
+            if previous == .interacting || previous == .decelerating {
+                let geometry = context.geometry
+                jumpVisibility.update(awayFromBottom: geometry.contentSize.height > geometry.visibleRect.maxY + 90,
+                                      userScrolling: true)
+            }
+        }
         .onChange(of: timeline.rows.count) { previousCount, count in
-            if count > previousCount, !showsJumpToLatest, timeline.rows.last?.turn.user != nil {
+            if count > previousCount, !jumpVisibility.isVisible, timeline.rows.last?.turn.user != nil {
                 position.scrollTo(edge: .bottom)
             }
         }
         .onScrollGeometryChange(for: Bool.self) { geometry in
             geometry.contentSize.height > geometry.visibleRect.maxY + 90
         } action: { _, awayFromBottom in
-            if awayFromBottom, historyStart == nil, start > 0 { historyStart = start }
-            showsJumpToLatest = awayFromBottom
+            jumpVisibility.update(awayFromBottom: awayFromBottom, userScrolling: userScrolling)
         }
         .scrollEdgeEffectStyle(.soft, for: .bottom)
 #if os(iOS)
@@ -146,6 +149,7 @@ struct SessionTranscript: View {
 
     private var jumpButton: some View {
         Button {
+            jumpVisibility = TranscriptJumpVisibility()
             withAnimation(reduceMotion ? nil : .easeOut(duration: 0.22)) {
                 position.scrollTo(edge: .bottom)
             }
@@ -167,8 +171,6 @@ struct SessionTranscript: View {
 
 private struct TranscriptTurnRow: View {
     let row: TranscriptTimeline.Row
-    let timeline: TranscriptTimeline
-    let start: Int
     let isLive: Bool
     let isAwaitingPermission: Bool
 
@@ -176,7 +178,7 @@ private struct TranscriptTurnRow: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let turn = timeline.visibleTurn(row, from: start)
+        let turn = row.turn
         let responseStart = turn.responseStart
         let isExpanded = expansionOverride ?? isLive
         let hasCancelStatus = turn.entries.last?.kind == .status
@@ -292,6 +294,7 @@ private struct TranscriptEntryRow: View {
     let entry: ACPEntry
     let isStreaming: Bool
     var showAgentLabel = true
+
 
     @ScaledMetric(relativeTo: .body) private var textSize = ConversationLayout.transcriptTextSize
 
@@ -421,6 +424,7 @@ private struct TranscriptMarkdown: View {
     let text: String
     let isStreaming: Bool
     @State private var usedStreamingRenderer = false
+
 
     @ScaledMetric(relativeTo: .body) private var textSize = ConversationLayout.transcriptTextSize
 
@@ -623,8 +627,6 @@ private final class TranscriptMarkdownCache {
         let text: String
         let size: CGFloat
     }
-    private var pending: [Job] = []
-    private var worker: Task<Void, Never>?
     private var parsing: [Job: Task<RenderableDocument, Never>] = [:]
 
     func finishedDocument(for id: UUID, text: String, size: CGFloat, config: MarkdownRenderConfig) async -> RenderableDocument {
@@ -640,31 +642,6 @@ private final class TranscriptMarkdownCache {
         store(result, for: id, text: text, size: size)
         return result
     }
-
-    func prefetch(around index: Int, in timeline: TranscriptTimeline, from start: Int, size: CGFloat, streaming: Bool) {
-        // Limit look-ahead to neighboring replies. Skip collapsed work, live
-        // output and stale requests left behind by a fast scroll.
-        for neighbor in [index - 1, index + 1, index - 2, index + 2] where timeline.visibleRows(from: start).indices.contains(neighbor) {
-            if streaming && neighbor == timeline.rows.count - 1 { continue }
-            let turn = timeline.visibleTurn(timeline.rows[neighbor], from: start)
-            for entry in turn.entries[turn.responseStart...].prefix(2) where entry.kind == .agent {
-                guard !TranscriptMarkdown.isPlainParagraph(entry.text),
-                      document(for: entry.id, text: entry.text, size: size) == nil,
-                      !pending.contains(where: { $0.id == entry.id && $0.size == size }) else { continue }
-                pending.append(Job(id: entry.id, text: entry.text, size: size))
-            }
-        }
-        if pending.count > 8 { pending.removeFirst(pending.count - 8) }
-        guard worker == nil, !pending.isEmpty else { return }
-        worker = Task(priority: .utility) { [weak self] in
-            while let self, !pending.isEmpty {
-                let job = pending.removeFirst()
-                _ = await finishedDocument(for: job.id, text: job.text, size: job.size, config: TranscriptMarkdown.config(for: job.size))
-            }
-            self?.worker = nil
-        }
-    }
-
 
     init() {
         entries.countLimit = 512

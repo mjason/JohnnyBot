@@ -75,6 +75,42 @@ struct JohnnyBotTests {
         #expect(try first.pending(epoch: "one").isEmpty)
     }
 
+    @Test func opensCompletedCacheBeforeConnecting() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let client = ACPClient(address: "mqtts://localhost:8883/test", fingerprint: "test-pin")
+        let identity = DeviceIdentity(key: .init())
+        let name = [client.address, client.fingerprint, identity.id].joined(separator: "\n")
+        let epochKey = "goEpoch." + name
+        UserDefaults.standard.set("one", forKey: epochKey)
+        defer { UserDefaults.standard.removeObject(forKey: epochKey) }
+        let cache = try GoReplica(name: name, directory: directory)
+        func seed(_ scope: String, kind: String, items: [[String: Any]], more: Bool = false) throws {
+            let count = Int64(items.count)
+            let events = items.enumerated().map { i, data -> [String: Any] in
+                ["seq": Int64(i + 1), "kind": kind, "data": data]
+            }
+            _ = try cache.apply(["epoch": "one", "scope": scope, "after": Int64(0), "through": more ? count + 1 : count,
+                                 "more": more, "events": events], scope: scope, expected: .init(), epoch: "one")
+        }
+        try seed("threads/test", kind: "thread.upsert", items: ["ready", "partial", "missing", "stale"].map {
+            ["thread_id": $0, "workspace_id": "test", "path": ".", "history_imported": true]
+        })
+        let prompt = ["prompt": [["type": "text", "text": "cached"]]]
+        try seed("thread/ready", kind: "message.user", items: [prompt])
+        try seed("thread/partial", kind: "message.user", items: [prompt], more: true)
+        try seed("thread/stale", kind: "turn.started", items: [["turn_id": "finished-while-offline"]])
+        try client.prepareReplica(identity: identity, directory: directory)
+        try client.restoreCachedDirectory(.init(path: "test"))
+        for id in ["ready", "partial", "missing", "stale"] { try client.restoreCachedTranscript(id) }
+        #expect(!client.connected)
+        #expect(client.loaded == ["ready", "stale"])
+        #expect(!client.prompting.contains("stale"))
+        #expect(client.awaitingTurnStatus("stale"))
+        #expect(client.timelines["ready"]?.rows.first?.turn.user?.text == "cached")
+        #expect(client.timelines["partial"]?.entryCount == 1)
+    }
+
     @Test func groupsIntermediateWorkWithoutHidingTheFinalResponse() throws {
         let turns = TranscriptTurn.group([
             ACPEntry(kind: .user, text: "First request"),

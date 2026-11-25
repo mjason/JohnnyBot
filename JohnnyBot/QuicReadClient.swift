@@ -55,7 +55,7 @@ import Security
         connections[id] = connection
         defer { connections[id] = nil; connection.cancel() }
         connection.start(queue: .global())
-        let timeout = Task {
+        var timeout = Task {
             try await Task.sleep(for: .seconds(3))
             connection.cancel()
         }
@@ -70,6 +70,14 @@ import Security
             while true {
                 let header = try await read(5, from: connection)
                 timeout.cancel()
+                if follow {
+                    // The server emits a heartbeat every 15 seconds. A silent
+                    // connection must eventually yield to MQTT or reconnect.
+                    timeout = Task {
+                        try await Task.sleep(for: .seconds(35))
+                        connection.cancel()
+                    }
+                }
                 let length = header.dropFirst().reduce(0) { ($0 << 8) | Int($1) }
                 guard length <= 256 * 1024 else { throw URLError(.cannotParseResponse) }
                 let data = length == 0 ? Data() : try await read(length, from: connection)

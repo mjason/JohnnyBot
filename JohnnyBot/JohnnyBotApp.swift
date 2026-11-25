@@ -47,10 +47,18 @@ struct JohnnyBotApp: App {
 
     private var mainWindow: some Scene {
         WindowGroup("JohnnyBot", id: "main") {
+#if DEBUG && targetEnvironment(simulator)
+            if CommandLine.arguments.contains("-testHistoryPagination") {
+                PaginationTestTranscript()
+            } else {
+                ContentView().environment(terminals)
+            }
+#else
             ContentView()
                 .environment(terminals)
 #if os(macOS)
                 .background(HideTitlebarSeparator())
+#endif
 #endif
         }
     }
@@ -185,6 +193,24 @@ struct TerminalWindowRestoreFrame {
         let left = min(max(0, frame.minX - display.minX), visibleFrame.width - width)
         let top = min(max(0, display.maxY - frame.maxY), visibleFrame.height - height)
         return NSRect(x: visibleFrame.minX + left, y: visibleFrame.maxY - top - height, width: width, height: height)
+    }
+}
+#endif
+
+#if DEBUG && targetEnvironment(simulator)
+private struct PaginationTestTranscript: View {
+    @State private var timeline = TranscriptTimeline()
+
+    var body: some View {
+        SessionTranscript(timeline: timeline, isResponding: false, permissions: [],
+                          horizontalMargin: 16, composerSpacing: 18) { _, _ in }
+            .onAppear {
+                var entries = (0..<125).map { ACPEntry(kind: .user, text: "测试消息 \($0)") }
+                let paragraph = String(repeating: "这段文字用于验证窄屏换行和消息之间的间距。", count: 10)
+                let reply = [paragraph, "**检查结果** " + paragraph, "已完成验证。"].joined(separator: "\n\n")
+                entries.insert(ACPEntry(kind: .agent, text: reply), at: 124)
+                timeline.replace(entries)
+            }
     }
 }
 #endif

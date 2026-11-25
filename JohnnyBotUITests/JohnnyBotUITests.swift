@@ -35,6 +35,37 @@ final class JohnnyBotUITests: XCTestCase {
 
 #if os(iOS)
     @MainActor
+    func testSeamlessHistoryOnPhone() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["-testHistoryPagination"]
+        app.launch()
+        func message(_ index: Int) -> XCUIElement {
+            app.descendants(matching: .any).matching(NSPredicate(format: "label ENDSWITH %@", "测试消息 \(index)")).firstMatch
+        }
+        let last = message(124)
+        XCTAssertTrue(last.waitForExistence(timeout: 5))
+        let ending = app.textViews.matching(
+            NSPredicate(format: "label ENDSWITH %@", "已完成验证。")
+        ).firstMatch
+        XCTAssertTrue(ending.waitForExistence(timeout: 5), app.debugDescription)
+        let gap = last.frame.minY - ending.frame.maxY
+        XCTAssertGreaterThanOrEqual(gap, 0)
+        XCTAssertLessThan(gap, 48)
+        let earlier = message(24)
+        for _ in 0..<30 {
+            if earlier.exists && earlier.isHittable { break }
+            app.swipeDown(velocity: .fast)
+        }
+        XCTAssertTrue(earlier.isHittable)
+        XCTAssertFalse(app.buttons["加载更早的消息"].exists)
+        XCTAssertFalse(app.staticTexts["历史消息"].exists)
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "连续浏览历史消息"
+        shot.lifetime = .keepAlways
+        add(shot)
+    }
+
+    @MainActor
     func testPhoneConnectionRequiresAddressAndFingerprint() throws {
         let app = XCUIApplication()
         app.launchArguments = ["-mqttServerTabs", "()"]

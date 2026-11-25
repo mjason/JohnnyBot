@@ -477,7 +477,10 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                         try client.restoreCache()
                         restoreProjects()
                         if let project = workspace.activeProject {
-                            Task { try? await client.listSessions(in: project); openSelectedSession() }
+                            try client.restoreCachedDirectory(project)
+                            if let id = workspace.selection, client.directory.contains(id, in: project) {
+                                try client.restoreCachedTranscript(id)
+                            }
                         }
                     } catch { workspace.failure = error.localizedDescription }
                 }
@@ -488,7 +491,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
             if offline && !workspace.managing && scenePhase == .active { reconnectIfNeeded() }
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { client.catchUp(); reconnectIfNeeded() }
+            if phase == .active { client.catchUp(afterForeground: true); reconnectIfNeeded() }
         }
         .task(id: client.offline && scenePhase == .active) {
             while client.offline && scenePhase == .active {
@@ -1358,6 +1361,9 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         guard client.available, client.supportsSessionLoad, let id = workspace.selection,
               !client.loaded.contains(id), workspace.sessionLoadFailure?.id != id,
               let session = client.directory.session(id: id) else { return }
+        do { try client.restoreCachedTranscript(id) }
+        catch { workspace.sessionLoadFailure = (id, error); return }
+        guard !client.loaded.contains(id) else { return }
         manage {
             guard client.available, workspace.selection == id else { return }
             do {
@@ -1400,6 +1406,11 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
 
             }
             if isLoaded {
+                if client.awaitingTurnStatus(id) {
+                    Text(client.connected ? "正在核对回复状态…" : "离线，回复状态待同步")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 if let queue = client.queuedPrompts[id], !queue.isEmpty {
                     ForEach(queue) { message in
                         Label("待发送 · " + message.text, systemImage: "clock").font(.caption).lineLimit(2)
@@ -1416,7 +1427,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                         supportsFiles: client.supportsPromptFiles,
                         commands: options?.commands ?? [],
                         isPrompting: isPrompting,
-                        isManaging: workspace.managing || client.isArchived(id),
+                        isManaging: workspace.managing || client.isArchived(id) || client.submitting.contains(id),
                         horizontalMargin: horizontalMargin,
                         send: { sendDraft(in: id) },
                         stop: { run { try await client.cancelPrompt(in: id) } },
@@ -1529,7 +1540,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         let attachments = workspace.draftAttachments[id, default: []]
         let command = ACPCommand.commandText(in: text)
         guard !text.isEmpty || !attachments.isEmpty, command != "/", client.loaded.contains(id),
-              !client.prompting.contains(id), !workspace.managing else { return }
+              !client.prompting.contains(id), !client.submitting.contains(id), !workspace.managing else { return }
         let invocation = command?.prefix { !$0.isWhitespace } ?? ""
         let isKnownCommand = client.sessionOptions[id]?.commands.contains { $0.invocation == invocation } == true
         let prompt = isKnownCommand ? command ?? text : text

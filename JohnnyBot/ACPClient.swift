@@ -158,7 +158,13 @@ final class ACPClient {
     let directory = SessionDirectory()
     private(set) var sessionOptions: [String: ACPSessionOptions] = [:]
     private(set) var loaded: Set<String> = []
-    private(set) var prompting: Set<String> = []
+    private var confirmedThreads: Set<String> = []
+    private(set) var submitting: Set<String> = []
+    var prompting: Set<String> { connected ? confirmedThreads.intersection(turns.keys) : [] }
+
+    func awaitingTurnStatus(_ id: String) -> Bool {
+        turns[id] != nil && !confirmedThreads.contains(id)
+    }
     @ObservationIgnored private var entries: [String: [ACPEntry]] = [:]
     private(set) var timelines: [String: TranscriptTimeline] = [:]
 
@@ -176,7 +182,10 @@ final class ACPClient {
             timelines[id] = timeline
         }
     }
-    private(set) var permissions: [ACPPermission] = []
+    private var recordedPermissions: [ACPPermission] = []
+    var permissions: [ACPPermission] {
+        connected ? recordedPermissions.filter { confirmedThreads.contains($0.sessionID) } : []
+    }
 
     @ObservationIgnored private var broker: GoBroker?
     @ObservationIgnored private var reads: QuicReadClient?
@@ -199,7 +208,7 @@ final class ACPClient {
     @ObservationIgnored private var sendStarted: [String: ContinuousClock.Instant] = [:]
     private let timingStore = ACPReplyTimingStore()
     @ObservationIgnored private var timings: [String: [String: ACPReplyTiming]] = [:]
-    @ObservationIgnored private var turns: [String: String] = [:]
+    private var turns: [String: String] = [:]
     @ObservationIgnored private var poll: Task<Void, Never>?
     @ObservationIgnored private var epoch = ""
     private(set) var workspaceIDs: [String] = []
@@ -226,7 +235,7 @@ final class ACPClient {
         return result
     }
 
-    private func prepareReplica(identity: DeviceIdentity, directory: URL?) throws {
+    func prepareReplica(identity: DeviceIdentity, directory: URL?) throws {
         let name = [address, fingerprint.lowercased(), identity.id].joined(separator: "\n")
         if replicaName != name {
             clearMemory()
@@ -307,6 +316,7 @@ final class ACPClient {
         pulling.removeAll()
         subscriptions.removeAll()
         dirty.removeAll()
+        confirmedThreads.removeAll()
         connected = false
         offline = reason != nil && !workspaceIDs.isEmpty
         status = offline ? "离线 · " + displayName : "未连接"
@@ -320,11 +330,12 @@ final class ACPClient {
         timelines.removeAll()
         transcriptIndexes.removeAll()
         loaded.removeAll()
-        prompting.removeAll()
+        confirmedThreads.removeAll()
+        submitting.removeAll()
         turns.removeAll()
         sendStarted.removeAll()
         timings.removeAll()
-        permissions.removeAll()
+        recordedPermissions.removeAll()
         sessionOptions.removeAll()
         observedCommands.removeAll()
         queuedPrompts.removeAll()
@@ -415,7 +426,12 @@ final class ACPClient {
         }
     }
 
-    func catchUp() {
+    func catchUp(afterForeground: Bool = false) {
+        if afterForeground {
+            confirmedThreads.removeAll()
+            for follower in followers.values { follower.task.cancel() }
+            followers.removeAll()
+        }
         for scope in hydrated where followers[scope] == nil { hint(scope) }
         resumeOutbox()
     }
@@ -423,7 +439,10 @@ final class ACPClient {
     private func hint(_ scope: String) {
         guard connected, hydrated.contains(scope) else { return }
         if pulling[scope] != nil { dirty.insert(scope); return }
-        Task { do { try await sync(scope) } catch { if connected { status = error.localizedDescription } } }
+        Task {
+            guard connected, hydrated.contains(scope) else { return }
+            do { try await sync(scope) } catch { if connected { status = error.localizedDescription } }
+        }
     }
 
     private func cursorFields(_ position: GoReplica.Cursor, scope: String) -> [String: Any] {
@@ -431,6 +450,10 @@ final class ACPClient {
         if !position.epoch.isEmpty { fields["epoch"] = position.epoch }
         if position.through != 0 { fields["through"] = position.through }
         return fields
+    }
+
+    private func confirmActivity(_ scope: String) {
+        if scope.hasPrefix("thread/") { confirmedThreads.insert(String(scope.dropFirst(7))) }
     }
 
     private func streamPages(_ reads: QuicReadClient, cache: GoReplica, scope: String, follow: Bool,
@@ -452,11 +475,13 @@ final class ACPClient {
                page["after"] as? Int64 == position.after, page["through"] as? Int64 == position.after,
                page["more"] as? Bool == false, (page["events"] as? [Any])?.isEmpty == true {
                 complete = true
+                confirmActivity(scope)
                 return
             }
             let events = try cache.apply(page, scope: scope, expected: position, epoch: epoch)
             complete = page["more"] as? Bool == false
             applyEvents(events, scope: scope, replay: false, refreshList: false)
+            if complete { confirmActivity(scope) }
             if let workspace {
                 listNeedsRefresh = listNeedsRefresh || !events.isEmpty
                 if complete, listNeedsRefresh {
@@ -475,6 +500,7 @@ final class ACPClient {
             catch {
                 guard !Task.isCancelled, followers[scope]?.id == id, broker === transport else { return }
                 followers.removeValue(forKey: scope)
+                if scope.hasPrefix("thread/") { confirmedThreads.remove(String(scope.dropFirst(7))) }
                 nextQuicAttempt = .now.advanced(by: .seconds(30))
                 hint(scope)
             }
@@ -550,7 +576,10 @@ final class ACPClient {
                     }
                     let events = try cache.apply(page, scope: scope, expected: position, epoch: epoch)
                     applyEvents(events, scope: scope, replay: false)
-                    if page["more"] as? Bool != true { break }
+                    if page["more"] as? Bool != true {
+                        confirmActivity(scope)
+                        break
+                    }
                 }
             } while dirty.contains(scope)
         }
@@ -569,8 +598,8 @@ final class ACPClient {
             transcriptIndexes[id] = nil
             timelines[id]?.replace([])
             turns[id] = nil
-            prompting.remove(id)
-            permissions.removeAll { $0.sessionID == id }
+            confirmedThreads.remove(id)
+            recordedPermissions.removeAll { $0.sessionID == id }
             sessionOptions[id] = nil
             deletionSupport[id] = nil
         }
@@ -580,7 +609,9 @@ final class ACPClient {
         if scope.hasPrefix("threads/") {
             for event in events {
                 guard let id = event.data["thread_id"] as? String else { continue }
-                if event.kind == "thread.upsert" { threads[id] = event.data }
+                if event.kind == "thread.upsert" {
+                    threads[id] = event.data
+                }
                 if event.kind == "thread.deleted" { purge(id) }
             }
             if refreshList && (replay || !events.isEmpty) { rebuildLists(String(scope.dropFirst(8))) }
@@ -608,7 +639,6 @@ final class ACPClient {
                     queuedPrompts[id]?.removeAll { $0.id == cmd }
                 }
                 turns[id] = data["turn_id"] as? String
-                prompting.insert(id)
             case "message.user":
                 let blocks = data["prompt"] as? [[String: Any]] ?? []
                 let entry = ACPEntry(kind: .user, text: blocks.compactMap { $0["text"] as? String }.joined(),
@@ -625,11 +655,11 @@ final class ACPClient {
                     guard let option = item["optionId"] as? String, let name = item["name"] as? String else { return nil }
                     return .init(id: option, name: name)
                 }
-                permissions.append(.init(requestID: permission, sessionID: id, title: tool?["title"] as? String ?? "工具调用",
+                recordedPermissions.append(.init(requestID: permission, sessionID: id, title: tool?["title"] as? String ?? "工具调用",
                                          details: tool?["rawInput"].map { String(describing: $0) }, options: options))
             case "permission.resolved":
                 let key = data["permission_id"] as? String
-                permissions.removeAll { $0.sessionID == id && $0.requestID as? String == key }
+                recordedPermissions.removeAll { $0.sessionID == id && $0.requestID as? String == key }
             case "turn.finished":
                 if let turn = data["turn_id"] as? String, let url = URL(string: address) {
                     if !replay, let start = sendStarted.removeValue(forKey: id) {
@@ -644,8 +674,7 @@ final class ACPClient {
                 }
                 if turns[id] == data["turn_id"] as? String {
                     turns[id] = nil
-                    prompting.remove(id)
-                    permissions.removeAll { $0.sessionID == id }
+                    recordedPermissions.removeAll { $0.sessionID == id }
                 }
                 if let status = data["status"] as? String, status != "finished" { notice(status, in: id) }
             default: break
@@ -763,15 +792,40 @@ final class ACPClient {
         return id
     }
 
+    func restoreCachedTranscript(_ id: String) throws {
+        let scope = "thread/" + id
+        guard let cache = replica, !epoch.isEmpty else { return }
+        let cursor = try cache.cursor(scope)
+        guard cursor.epoch == epoch else { return }
+        try hydrate(scope, from: cache)
+        // A completed local snapshot can be opened while the transport catches up.
+        // A first import interrupted between pages still uses the normal load path.
+        guard cursor.through == 0, threads[id]?["history_imported"] as? Bool == true,
+              loaded.insert(id).inserted else { return }
+        if connected, followers[scope] == nil, pulling[scope] == nil { hint(scope) }
+    }
+
+    func restoreCachedDirectory(_ project: ACPProject) throws {
+        guard let cache = replica, !epoch.isEmpty else { return }
+        let scope = "threads/" + project.workspaceID
+        guard try cache.cursor(scope).epoch == epoch else { return }
+        let inserted = projects.insert(project).inserted
+        try hydrate(scope, from: cache)
+        if inserted { rebuildLists(project.workspaceID) }
+    }
+
     func load(_ session: ACPSession) async throws {
         let scope = "thread/" + session.id
-        if let cache = replica, try cache.cursor(scope).epoch == epoch, !epoch.isEmpty {
-            try hydrate(scope, from: cache)
-        }
+        try restoreCachedTranscript(session.id)
+        if loaded.contains(session.id) { return }
         if connected {
-            do { try await command("thread.open", ["thread_id": session.id], write: true) }
-            catch let error as ACPFailure where error.reason == "thread_busy" {
-                // An active turn can already be followed via its durable event stream.
+            // Imported threads already have a durable transcript. Prompt and
+            // settings commands attach the upstream agent when they need it.
+            if threads[session.id]?["history_imported"] as? Bool != true {
+                do { try await command("thread.open", ["thread_id": session.id], write: true) }
+                catch let error as ACPFailure where error.reason == "thread_busy" {
+                    // An active turn can already be followed via its durable event stream.
+                }
             }
         }
         else if try replica?.cursor(scope).epoch.isEmpty != false { throw ACPFailure(message: "此会话尚未缓存") }
@@ -842,20 +896,24 @@ final class ACPClient {
         sessionOptions[id] = options
     }
     func prompt(_ text: String, attachments: [ACPAttachment] = [], in id: String) async throws {
-        guard loaded.contains(id), !prompting.contains(id) else { throw ACPFailure(message: "会话尚未就绪") }
+        guard loaded.contains(id), !prompting.contains(id), !submitting.contains(id) else { throw ACPFailure(message: "会话尚未就绪") }
         var blocks: [[String: Any]] = text.isEmpty ? [] : [["type": "text", "text": text]]
         blocks += attachments.map(\.promptBlock)
         guard (1...32).contains(blocks.count) else { throw ACPFailure(message: "每条消息支持 1 至 32 项内容") }
-        prompting.insert(id)
+        submitting.insert(id)
         if connected { sendStarted[id] = .now }
-        defer { if turns[id] == nil { prompting.remove(id) } }
+        defer { submitting.remove(id) }
         let result = try await command("prompt.send", ["thread_id": id, "prompt": blocks], write: true, durable: true)
         if result["queued"] as? Bool == true { sendStarted[id] = nil }
         else { try await sync("thread/" + id) }
     }
     func cancelPrompt(in id: String) async throws {
-        guard let turn = turns[id] else { return }
-        try await command("turn.cancel", ["thread_id": id, "turn_id": turn], write: true)
+        guard prompting.contains(id), let turn = turns[id] else { return }
+        do {
+            try await command("turn.cancel", ["thread_id": id, "turn_id": turn], write: true)
+        } catch let error as ACPFailure where error.reason == "not_active" {
+            if turns[id] == turn { turns[id] = nil }
+        }
         try await sync("thread/" + id)
     }
     func respond(to permission: ACPPermission, option: String?) async throws {

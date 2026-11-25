@@ -142,6 +142,43 @@ struct StreamingTranscriptTests {
         #expect(copied == text.substring(with: selection.selectedRange()))
     }
 
+    @Test func scrollToStartReachesOldestReply() async throws {
+        let timeline = TranscriptTimeline()
+        let entries = (0..<125).flatMap { index in
+            [ACPEntry(kind: .user, text: "Question \(index)"), ACPEntry(kind: .agent, text: "Answer **\(index)**.")]
+        }
+        timeline.replace(entries)
+        let host = NSHostingView(rootView: SessionTranscript(timeline: timeline, isResponding: false,
+            permissions: [], horizontalMargin: 20, composerSpacing: 24) { _, _ in })
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 460),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = host
+        window.orderFront(nil)
+        defer { window.orderOut(nil) }
+
+        func descendant<T: NSView>(_ root: NSView, _ predicate: (T) -> Bool) -> T? {
+            if let view = root as? T, predicate(view) { return view }
+            for child in root.subviews {
+                if let found = descendant(child, predicate) { return found }
+            }
+            return nil
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        let scroll: NSScrollView = try #require(descendant(host) { ($0.documentView?.bounds.height ?? 0) > 1500 })
+        let wheel = try #require(CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
+                                         wheelCount: 1, wheel1: 120_000, wheel2: 0, wheel3: 0))
+        scroll.scrollWheel(with: try #require(NSEvent(cgEvent: wheel)))
+        try await Task.sleep(for: .milliseconds(350))
+        func replyY() -> CGFloat? {
+            let text: NSTextView? = descendant(host) { $0.string.contains("Answer 0.") }
+            return text.map { $0.convert(.zero, to: host).y }
+        }
+        #expect(scroll.contentView.bounds.minY <= 2)
+        let visibleY = try #require(replyY())
+        #expect((0...150).contains(visibleY))
+
+    }
+
     @Test func copiesAcrossParagraphsWhileReplyGrows() async throws {
         let timeline = TranscriptTimeline()
         var reply = ACPEntry(kind: .agent, text: "第一段落。\n\n第二段落。", phase: .finalAnswer)
