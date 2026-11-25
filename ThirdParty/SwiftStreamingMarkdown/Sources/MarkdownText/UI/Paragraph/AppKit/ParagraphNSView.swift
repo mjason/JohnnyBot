@@ -24,6 +24,18 @@ class ParagraphNSView: NSTextView {
   private var activeAnimations: [FadeAnimationData] = []
   private var fadeAnimationDisplayLink: CADisplayLink?
   private var cachedSize: CachedParagraphNSViewSize?
+  private var previousLayoutWidth: CGFloat?
+  // A second layout manager can measure different proposals on the same storage
+  // without changing the displayed text container or copying attributed text.
+  private lazy var measuringContainer: NSTextContainer = {
+    let container = NSTextContainer(containerSize: .zero)
+    container.lineFragmentPadding = 0
+    container.lineBreakMode = .byWordWrapping
+    let manager = NSLayoutManager()
+    manager.addTextContainer(container)
+    textStorage?.addLayoutManager(manager)
+    return container
+  }()
 
   var textContextMenu: TextContextMenu?
   var markdownController: MarkdownController?
@@ -81,35 +93,34 @@ class ParagraphNSView: NSTextView {
 
   /// Measures the size required to lay out the current content within `width`.
   ///
-  /// Uses a dedicated, throwaway layout stack instead of the view's own text container.
-  /// The display container has `widthTracksTextView = true`, so its width follows the
-  /// view's frame width regardless of any `containerSize` we set. When the view is
-  /// measured before it has been given a frame (e.g. mid navigation transition) that
-  /// tracked width is `0`, which yields a zero height and collapses the paragraph. A
-  /// standalone container whose width we set directly always measures correctly.
+  /// Use the display layout when its width matches. SwiftUI also asks about
+  /// other widths before assigning a frame, including during window resizing.
   func measureSize(fittingWidth width: CGFloat) -> CGSize {
-    guard let textStorage, textStorage.length > 0, width > 0, width.isFinite else {
-      return .zero
+    guard let textStorage, textStorage.length > 0, width > 0, width.isFinite else { return .zero }
+    let container: NSTextContainer
+    if let display = textContainer, display.containerSize.width == width {
+      container = display
+    } else {
+      container = measuringContainer
+      if container.containerSize.width != width {
+        container.containerSize = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+      }
     }
-    let measuringTextStorage = NSTextStorage(attributedString: textStorage)
-    let measuringLayoutManager = NSLayoutManager()
-    let measuringContainer = NSTextContainer(size: NSSize(width: width, height: CGFloat.greatestFiniteMagnitude))
-    measuringContainer.lineFragmentPadding = 0
-    measuringContainer.maximumNumberOfLines = 0
-    measuringContainer.lineBreakMode = .byWordWrapping
-    measuringLayoutManager.addTextContainer(measuringContainer)
-    measuringTextStorage.addLayoutManager(measuringLayoutManager)
-    measuringLayoutManager.ensureLayout(for: measuringContainer)
-    let usedRect = measuringLayoutManager.usedRect(for: measuringContainer)
-    return CGSize(width: usedRect.width.rounded(.up), height: usedRect.height.rounded(.up))
+    guard let manager = container.layoutManager else { return .zero }
+    manager.ensureLayout(for: container)
+    let used = manager.usedRect(for: container)
+    return CGSize(width: used.width.rounded(.up), height: used.height.rounded(.up))
   }
 
   override func layout() {
     super.layout()
-    if bounds.width != cachedSize?.targetWidth {
+    let width = bounds.width
+    guard previousLayoutWidth != width else { return }
+    previousLayoutWidth = width
+    if cachedSize?.targetWidth != width {
       invalidateCachedSize()
+      invalidateIntrinsicContentSize()
     }
-    invalidateIntrinsicContentSize()
   }
 
   // MARK: - Content Update

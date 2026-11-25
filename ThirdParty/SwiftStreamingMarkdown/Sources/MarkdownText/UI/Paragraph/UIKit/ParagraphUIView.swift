@@ -28,6 +28,7 @@ class ParagraphUIView: UITextView {
   private var activeAnimations: [FadeAnimationData] = []
   private var fadeAnimationDisplayLink: CADisplayLink?
   private var cachedSize: CachedParagraphUIViewSize?
+  private var previousLayoutWidth: CGFloat?
 
   var textContextMenu: TextContextMenu?
   var markdownController: MarkdownController?
@@ -93,10 +94,13 @@ class ParagraphUIView: UITextView {
 
   override func layoutSubviews() {
     super.layoutSubviews()
-    if bounds.width != cachedSize?.targetWidth {
+    let width = bounds.width
+    guard previousLayoutWidth != width else { return }
+    previousLayoutWidth = width
+    if width != cachedSize?.targetWidth {
       invalidateCachedSize()
+      invalidateIntrinsicContentSize()
     }
-    invalidateIntrinsicContentSize()
   }
 
   func setParagraphContents(_ newContents: NSMutableAttributedString, lineSpacing: CGFloat? = nil, animatedByWord: Bool) {

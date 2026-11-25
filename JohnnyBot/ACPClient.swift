@@ -22,12 +22,6 @@ struct ACPFailure: LocalizedError {
     }
 }
 
-struct ACPSession: Identifiable {
-    let id: String
-    var title: String
-    var cwd = ""
-}
-
 struct ACPProject: Hashable, Identifiable {
     let path: String?
     var id: String { path ?? "" }
@@ -121,14 +115,26 @@ struct ACPPermission: Identifiable {
 @MainActor @Observable
 final class ACPClient {
     @ObservationIgnored private var streamUpdates: [(String, [String: Any])] = []
+    @ObservationIgnored private var batchOffsets: [String: Set<Int>]?
     @ObservationIgnored private var streamFlush: Task<Void, Never>?
     @ObservationIgnored private var peerTurns = Set<String>()
 
     private func flushStream() {
         streamFlush?.cancel()
         streamFlush = nil
+        guard !streamUpdates.isEmpty else { return }
+        batchOffsets = [:]
         for (session, update) in streamUpdates { apply(update, to: session) }
         streamUpdates.removeAll(keepingCapacity: true)
+        let changes = batchOffsets ?? [:]
+        batchOffsets = nil
+        for (id, offsets) in changes {
+            if let timeline = timelines[id], let history = entries[id] {
+                timeline.update(history, changedOffsets: offsets)
+            } else if let offset = offsets.first {
+                publishEntry(in: id, at: offset)
+            }
+        }
     }
 
     private func enqueueStream(_ update: [String: Any], session: String) {
@@ -182,19 +188,36 @@ final class ACPClient {
     private(set) var supportsPromptImages = false
     private(set) var supportsPromptFiles = false
     private var supportsSessionClose = false
-    private(set) var sessions: [ACPSession] = []
-    private(set) var projectSessionIDs: [ACPProject: [String]] = [:]
+    let directory = SessionDirectory()
     private(set) var sessionOptions: [String: ACPSessionOptions] = [:]
     private(set) var loaded: Set<String> = []
     private(set) var prompting: Set<String> = []
-    private(set) var entries: [String: [ACPEntry]] = [:]
+    @ObservationIgnored private var entries: [String: [ACPEntry]] = [:]
+    private(set) var timelines: [String: TranscriptTimeline] = [:]
+
+    private func publishEntry(in id: String, at offset: Int) {
+        if batchOffsets != nil {
+            batchOffsets?[id, default: []].insert(offset)
+            return
+        }
+        guard let history = entries[id] else { return }
+        if let timeline = timelines[id] {
+            timeline.update(history, at: offset)
+        } else {
+            let timeline = TranscriptTimeline()
+            timeline.replace(history)
+            timelines[id] = timeline
+        }
+    }
     private(set) var permissions: [ACPPermission] = []
 
     @ObservationIgnored private var socket: URLSessionWebSocketTask?
     @ObservationIgnored private var pending: [Int: CheckedContinuation<[String: Any], Error>] = [:]
     @ObservationIgnored private var nextID = 0
-    @ObservationIgnored private var listingProjects: Set<ACPProject> = []
-    @ObservationIgnored private var titleRevision = 0
+    @ObservationIgnored private var listingProjects: [ACPProject: (titlesOnly: Bool, task: Task<Void, Error>)] = [:]
+    @ObservationIgnored private var directoryRevision = 0
+    // A page that was already in flight must not bring back a deleted session.
+    @ObservationIgnored private var deletedDuringListing: [String: Int] = [:]
     @ObservationIgnored private var titleUpdates: [String: (title: String, revision: Int)] = [:]
     @ObservationIgnored private var replayHistory: [String: [ACPEntry]] = [:]
     @ObservationIgnored private var transcriptIndexes: [String: TranscriptIndex] = [:]
@@ -318,11 +341,12 @@ final class ACPClient {
         loaded.removeAll()
         prompting.removeAll()
         permissions.removeAll()
-        sessions.removeAll()
-        projectSessionIDs.removeAll()
+        directory.removeAll()
         listingProjects.removeAll()
+        deletedDuringListing.removeAll()
         titleUpdates.removeAll()
         entries.removeAll()
+        timelines.removeAll()
         replayHistory.removeAll()
         transcriptIndexes.removeAll()
     }
@@ -364,21 +388,31 @@ final class ACPClient {
         return listing
     }
 
-    func sessions(in project: ACPProject) -> [ACPSession] {
-        let byID = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
-        return projectSessionIDs[project, default: []].compactMap { byID[$0] }
-    }
-
     func listSessions(in project: ACPProject, titlesOnly: Bool = false) async throws {
         guard supportsSessionList else { return }
-        guard let socket else { throw ACPFailure(message: "请先连接服务器") }
-        guard listingProjects.insert(project).inserted else { return }
-        defer {
-            if self.socket === socket { listingProjects.remove(project) }
+        guard let connection = socket else { throw ACPFailure(message: "请先连接服务器") }
+        while let listing = listingProjects[project] {
+            try await listing.task.value
+            guard socket === connection else { throw ACPFailure(message: "连接已断开") }
+            if titlesOnly || !listing.titlesOnly { return }
         }
+        let task = Task {
+            defer {
+                if socket === connection {
+                    listingProjects.removeValue(forKey: project)
+                    if listingProjects.isEmpty { deletedDuringListing.removeAll() }
+                }
+            }
+            try await fetchSessions(in: project, titlesOnly: titlesOnly, connection: connection)
+        }
+        listingProjects[project] = (titlesOnly, task)
+        try await task.value
+    }
 
-        let startingRevision = titleRevision
-        var listed: [ACPSession] = []
+    private func fetchSessions(in project: ACPProject, titlesOnly: Bool, connection: URLSessionWebSocketTask) async throws {
+        guard socket === connection else { throw ACPFailure(message: "连接已断开") }
+        let startingRevision = directoryRevision
+        var listed: [ListedSession] = []
         var listedIDs: Set<String> = []
         var cursor: String?
         var seenCursors: Set<String> = []
@@ -387,39 +421,45 @@ final class ACPClient {
             params["cwd"] = project.path
             params["cursor"] = cursor
             let result = try await call("session/list", params)
-            guard self.socket === socket else { throw ACPFailure(message: "连接已断开") }
+            guard socket === connection else { throw ACPFailure(message: "连接已断开") }
             for item in result["sessions"] as? [[String: Any]] ?? [] {
                 let cwd = item["cwd"] as? String ?? project.path ?? ""
                 guard project.path == nil || project.path == cwd,
-                      let id = item["sessionId"] as? String, listedIDs.insert(id).inserted else { continue }
-                let title = item["title"] as? String ?? titleUpdates[id]?.title ?? "未命名会话"
-                listed.append(ACPSession(id: id, title: title, cwd: cwd))
+                      let id = item["sessionId"] as? String,
+                      deletedDuringListing[id, default: 0] <= startingRevision,
+                      listedIDs.insert(id).inserted else { continue }
+                let listedTitle: String
+                if let update = titleUpdates[id], update.revision > startingRevision {
+                    listedTitle = update.title
+                } else {
+                    listedTitle = item["title"] as? String ?? titleUpdates[id]?.title ?? "未命名会话"
+                }
+                listed.append(ListedSession(id: id, title: listedTitle, cwd: cwd))
             }
+            let firstPage = cursor == nil
             cursor = result["nextCursor"] as? String
+            if firstPage, !titlesOnly, cursor?.isEmpty == false, !directory.hasListed(project) {
+                directory.replace(listed, ids: listedIDs, in: project, retaining: loaded, complete: false)
+            }
             if let cursor, !cursor.isEmpty, !seenCursors.insert(cursor).inserted {
                 throw ACPFailure(message: "服务器返回重复的分页游标")
             }
         } while cursor?.isEmpty == false
 
+        if !deletedDuringListing.isEmpty {
+            listed.removeAll { deletedDuringListing[$0.id, default: 0] > startingRevision }
+            listedIDs = Set(listed.map(\.id))
+        }
         for index in listed.indices {
             if let update = titleUpdates[listed[index].id], update.revision > startingRevision {
                 listed[index].title = update.title
             }
         }
         if titlesOnly {
-            let titles = Dictionary(uniqueKeysWithValues: listed.map { ($0.id, $0.title) })
-            for index in sessions.indices {
-                if let title = titles[sessions[index].id], sessions[index].title != title {
-                    sessions[index].title = title
-                }
-            }
-            return
+            for item in listed { directory.updateTitle(item.title, for: item.id) }
+        } else {
+            directory.replace(listed, ids: listedIDs, in: project, retaining: loaded, complete: true)
         }
-
-        let localIDs = projectSessionIDs[project, default: []].filter { loaded.contains($0) && !listedIDs.contains($0) }
-        projectSessionIDs[project] = listed.map(\.id) + localIDs
-        let retained = Set(projectSessionIDs.values.joined()).union(loaded)
-        sessions = listed + sessions.filter { retained.contains($0.id) && !listedIDs.contains($0.id) }
     }
 
     func createSession(in project: ACPProject) async throws -> String {
@@ -432,12 +472,10 @@ final class ACPClient {
             throw ACPFailure(message: "服务器未返回会话 ID")
         }
         let cwd = result["cwd"] as? String ?? project.path ?? ""
-        sessions.removeAll { $0.id == id }
         let title = titleUpdates[id]?.title ?? result["title"] as? String ?? "新会话"
-        sessions.insert(ACPSession(id: id, title: title, cwd: cwd), at: 0)
-        projectSessionIDs[project, default: []].removeAll { $0 == id }
-        projectSessionIDs[project, default: []].insert(id, at: 0)
+        directory.insert(ACPSession(id: id, title: title, cwd: cwd), in: project, atFront: true)
         applySessionSetup(result, to: id)
+        if timelines[id] == nil { timelines[id] = TranscriptTimeline() }
         loaded.insert(id)
         return id
     }
@@ -462,6 +500,9 @@ final class ACPClient {
                     }
                 }
             }
+            let timeline = TranscriptTimeline()
+            timeline.replace(history)
+            timelines[id] = timeline
             entries[id] = history
             applySessionSetup(result, to: id)
             loaded.insert(id)
@@ -470,6 +511,7 @@ final class ACPClient {
                 replayHistory.removeValue(forKey: id)
                 transcriptIndexes.removeValue(forKey: id)
                 entries.removeValue(forKey: id)
+                timelines.removeValue(forKey: id)
                 sessionOptions.removeValue(forKey: id)
             }
             throw error
@@ -482,10 +524,7 @@ final class ACPClient {
         guard let connection = socket else { throw ACPFailure(message: "请先连接服务器") }
         try await load(session)
         guard socket === connection, loaded.contains(session.id) else { throw ACPFailure(message: "未能恢复会话") }
-        if !sessions.contains(where: { $0.id == session.id }) { sessions.append(session) }
-        if projectSessionIDs[project]?.contains(session.id) != true {
-            projectSessionIDs[project, default: []].append(session.id)
-        }
+        directory.insert(session, in: project, atFront: false)
     }
 #endif
 
@@ -527,13 +566,15 @@ final class ACPClient {
         loaded.remove(id)
         sessionOptions.removeValue(forKey: id)
         entries.removeValue(forKey: id)
+        timelines.removeValue(forKey: id)
         transcriptIndexes.removeValue(forKey: id)
         permissions.removeAll { $0.sessionID == id }
-        sessions.removeAll { $0.id == id }
-        titleUpdates.removeValue(forKey: id)
-        for project in Array(projectSessionIDs.keys) {
-            projectSessionIDs[project]?.removeAll { $0 == id }
+        directory.remove(id)
+        if !listingProjects.isEmpty {
+            directoryRevision += 1
+            deletedDuringListing[id] = directoryRevision
         }
+        titleUpdates.removeValue(forKey: id)
     }
 
     func renameSession(_ session: ACPSession, to draft: String) async throws {
@@ -560,7 +601,7 @@ final class ACPClient {
 
     private func setSessionTitle(_ title: String, in id: String) async throws {
         guard let socket else { throw ACPFailure(message: "请先连接服务器") }
-        let startingRevision = titleRevision
+        let startingRevision = directoryRevision
         let result = try await call("session/set_title", ["sessionId": id, "title": title])
         guard self.socket === socket else { throw ACPFailure(message: "连接已断开") }
         if let update = titleUpdates[id], update.revision > startingRevision { return }
@@ -568,11 +609,9 @@ final class ACPClient {
     }
 
     private func updateSessionTitle(_ title: String, in id: String) {
-        titleRevision += 1
-        titleUpdates[id] = (title, titleRevision)
-        if let index = sessions.firstIndex(where: { $0.id == id }) {
-            sessions[index].title = title
-        }
+        directoryRevision += 1
+        titleUpdates[id] = (title, directoryRevision)
+        directory.updateTitle(title, for: id)
     }
 
     func setConfigOption(_ option: ACPConfigOption, value: String, in id: String) async throws {
@@ -638,7 +677,10 @@ final class ACPClient {
         prompting.insert(id)
         let startedAt = ContinuousClock.now
         let userEntry = ACPEntry(kind: .user, text: text, attachments: attachments.map(\.preview))
-        entries[id, default: []].append(userEntry)
+        updateTranscript(id) { history, _ in
+            history.append(userEntry)
+            return history.count - 1
+        }
         defer { if self.socket === socket && !peerTurns.contains(id) { prompting.remove(id) } }
         let result: [String: Any]
         do {
@@ -648,6 +690,7 @@ final class ACPClient {
                entries[id]?.last?.id == userEntry.id || (error as? ACPFailure)?.code == -32010,
                let offset = entries[id]?.firstIndex(where: { $0.id == userEntry.id }) {
                 entries[id]?.remove(at: offset)
+                timelines[id]?.replace(entries[id] ?? [])
                 // Removing an optimistic entry shifts indexes for later messages.
                 transcriptIndexes[id] = TranscriptIndex()
                 for (index, entry) in (entries[id] ?? []).enumerated() {
@@ -660,7 +703,10 @@ final class ACPClient {
         guard self.socket === socket else { return }
         let stopReason = result["stopReason"] as? String
         if let stopReason, stopReason != "end_turn" {
-            entries[id, default: []].append(ACPEntry(kind: .status, text: stopReason))
+            updateTranscript(id) { history, _ in
+                history.append(ACPEntry(kind: .status, text: stopReason))
+                return history.count - 1
+            }
         }
         guard let history = entries[id], let promptIndex = history.lastIndex(where: { $0.id == userEntry.id }) else { return }
         let timing = ACPReplyTiming(elapsed: startedAt.duration(to: .now),
@@ -669,6 +715,7 @@ final class ACPClient {
         let anchor = response.lastIndex { $0.kind == .agent && $0.replyTimingID != nil }
             ?? response.lastIndex { $0.replyTimingID != nil }
         entries[id]?[anchor ?? promptIndex].replyTiming = timing
+        publishEntry(in: id, at: anchor ?? promptIndex)
         if let anchor, let key = history[anchor].replyTimingID, let endpoint = socket.originalRequest?.url {
             replyTimingStore.record(timing, for: key, endpoint: endpoint, sessionID: id)
         }
@@ -729,15 +776,29 @@ final class ACPClient {
         try await socket.send(.string(encode(message)))
     }
 
+    nonisolated private static func decodeFrame(_ text: String) throws -> sending [String: Any]? {
+        try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
+    }
+
+    @concurrent private static func decodeLargeFrame(_ text: String) async throws -> sending [String: Any]? {
+        try decodeFrame(text)
+    }
+
     private func receive(from socket: URLSessionWebSocketTask) async {
         var nextYield = ContinuousClock.now + .milliseconds(8)
         do {
             while self.socket === socket {
                 let frame = try await socket.receive()
                 guard self.socket === socket else { return }
-                guard case .string(let text) = frame,
-                      let message = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
-                      message["jsonrpc"] as? String == "2.0" else { continue }
+                guard case .string(let text) = frame else { continue }
+                let decoded: [String: Any]?
+                if text.utf8.count >= 32 * 1024 {
+                    decoded = try await Self.decodeLargeFrame(text)
+                    guard self.socket === socket else { return }
+                } else {
+                    decoded = try Self.decodeFrame(text)
+                }
+                guard let message = decoded, message["jsonrpc"] as? String == "2.0" else { continue }
                 if let method = message["method"] as? String {
                     try await handle(method, message: message, socket: socket)
                 } else if let id = message["id"] as? Int, let continuation = pending.removeValue(forKey: id) {
@@ -818,6 +879,7 @@ final class ACPClient {
             if let status = detail ?? reason, status != "end_turn" {
                 updateTranscript(sessionID) { history, _ in
                     history.append(ACPEntry(kind: .status, text: status))
+                    return history.count - 1
                 }
             }
         } else if method == "session/update", let sessionID, let update = params["update"] as? [String: Any] {
@@ -825,11 +887,11 @@ final class ACPClient {
         }
     }
 
-    private func updateTranscript(_ id: String, _ apply: (inout [ACPEntry], inout TranscriptIndex) -> Void) {
+    private func updateTranscript(_ id: String, _ apply: (inout [ACPEntry], inout TranscriptIndex) -> Int?) {
         if replayHistory[id] != nil {
-            apply(&replayHistory[id, default: []], &transcriptIndexes[id, default: TranscriptIndex()])
-        } else {
-            apply(&entries[id, default: []], &transcriptIndexes[id, default: TranscriptIndex()])
+            _ = apply(&replayHistory[id, default: []], &transcriptIndexes[id, default: TranscriptIndex()])
+        } else if let offset = apply(&entries[id, default: []], &transcriptIndexes[id, default: TranscriptIndex()]) {
+            publishEntry(in: id, at: offset)
         }
     }
 
@@ -865,10 +927,12 @@ final class ACPClient {
                     history[previousIndex].text += text
                     if let attachment { history[previousIndex].attachments.append(attachment) }
                     if let phase { history[previousIndex].phase = phase }
+                    return previousIndex
                 } else {
                     if let key { index.messages[key] = history.count }
                     history.append(ACPEntry(kind: entryKind, text: text, messageID: messageID, phase: phase,
                                             attachments: attachment.map { [$0] } ?? []))
+                    return history.count - 1
                 }
             }
         case "tool_call", "tool_call_update":
@@ -901,6 +965,7 @@ final class ACPClient {
                         }
                     }
                 }
+                return offset
             }
         case "plan":
             guard let rawSteps = update["entries"] as? [[String: Any]] else { return }
@@ -909,9 +974,12 @@ final class ACPClient {
                 let turnStart = (history.lastIndex { $0.kind == .user } ?? -1) + 1
                 if let index = history[turnStart...].lastIndex(where: { $0.kind == .plan }) {
                     history[index].planSteps = steps
+                    return index
                 } else if !steps.isEmpty {
                     history.append(ACPEntry(kind: .plan, text: "", planSteps: steps))
+                    return history.count - 1
                 }
+                return nil
             }
         case "available_commands_update":
             guard let commands = update["availableCommands"] as? [[String: Any]] else { return }

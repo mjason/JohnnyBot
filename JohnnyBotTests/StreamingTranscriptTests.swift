@@ -9,7 +9,9 @@ struct StreamingTranscriptTests {
     @Test func wrappedParagraphKeepsItsLayoutWhenStreamingFinishes() async throws {
         var reply = ACPEntry(kind: .agent, text: "第一行")
         func transcript(live: Bool) -> SessionTranscript {
-            SessionTranscript(entries: [reply], isResponding: live, permissions: [],
+            let timeline = TranscriptTimeline()
+            timeline.replace([reply])
+            return SessionTranscript(timeline: timeline, isResponding: live, permissions: [],
                               horizontalMargin: 20, composerSpacing: 24) { _, _ in }
         }
         let host = NSHostingView(rootView: transcript(live: true))

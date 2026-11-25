@@ -341,7 +341,6 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         guard let initial = workspace.defaultProject else { return [] }
         return [initial] + workspace.addedProjects.filter { $0 != initial }
     }
-    @State private var hoveredSession: String?
     @State private var sessionToDelete: ACPSession?
 
 #if os(iOS)
@@ -357,7 +356,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 NavigationStack(path: phonePath) {
                     projectSidebar(selection: nil)
                         .navigationDestination(for: String.self) { id in
-                            if let session = client.sessions.first(where: { $0.id == id }) {
+                            if let session = client.directory.session(id: id) {
                                 conversation(session)
                             }
                         }
@@ -457,9 +456,9 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
 #endif
         .onChange(of: workspace.selection, initial: true) { _, id in
             workspace.sessionLoadFailure = nil
-            if let id, let project = projects.first(where: { client.projectSessionIDs[$0]?.contains(id) == true }) {
+            if let id, let project = projects.first(where: { client.directory.contains(id, in: $0) }) {
                 workspace.activeProject = project
-                if let session = client.sessions.first(where: { $0.id == id }) {
+                if let session = client.directory.session(id: id) {
                     let location = ["id": id, "project": project.id, "title": session.title, "cwd": session.cwd]
                     UserDefaults.standard.set(location, forKey: "acpLastSession." + client.address)
                 }
@@ -514,26 +513,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
     }
 
     private func projectSidebar(selection: Binding<String?>?) -> some View {
-        List(selection: selection) {
-            Section("项目", isExpanded: Binding(
-                get: { workspace.projectSectionExpanded },
-                set: { expanded in
-                    workspace.projectSectionExpanded = expanded
-                    if client.connected {
-                        UserDefaults.standard.set(expanded, forKey: "acpProjectSectionExpanded." + client.address)
-                    }
-                }
-            )) {
-                if projects.isEmpty {
-                    Text(client.connected ? "正在加载项目…" : "连接服务器后显示项目")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-                ForEach(projects) { project in
-                    projectRow(project)
-                }
-            }
-        }
+        sidebarContent(selection: selection)
 #if os(macOS)
         .toolbar(removing: .sidebarToggle)
 #endif
@@ -541,11 +521,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
 #if os(iOS)
         .navigationTitle("会话")
         .navigationSubtitle(client.displayName)
-        .refreshable {
-            guard client.supportsSessionList, !workspace.managing, let project = workspace.activeProject else { return }
-            do { try await client.listSessions(in: project) }
-            catch { if client.connected && !Task.isCancelled { workspace.failure = error.localizedDescription } }
-        }
+        .refreshable { await refreshActiveProject() }
         .toolbar {
             ToolbarItem(placement: .topBarLeading) { header() }
             ToolbarItemGroup(placement: .topBarTrailing) {
@@ -658,12 +634,107 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
 #endif
     }
 
+    private func setSectionExpanded(_ expanded: Bool) {
+        workspace.projectSectionExpanded = expanded
+        if client.connected {
+            UserDefaults.standard.set(expanded, forKey: "acpProjectSectionExpanded." + client.address)
+        }
+    }
+
+    private var sidebarGroups: [SidebarProjectGroup] {
+        projects.map { project in
+            let expanded = workspace.expandedProjects.contains(project)
+            return SidebarProjectGroup(project: project, expanded: expanded,
+                                       revision: expanded ? client.directory.revision(in: project) : 0,
+                                       rows: expanded ? client.directory.rows(in: project) : [])
+        }
+    }
+
+    private func discloseProject(_ project: ACPProject, expanded: Bool) {
+        setProject(project, expanded: expanded)
+        if expanded { workspace.activeProject = project }
+    }
+
+    private func selectSession(_ session: ACPSession, in project: ACPProject) {
+        guard client.directory.contains(session.id, in: project) else { return }
+        workspace.activeProject = project
+        workspace.selection = session.id
+    }
+
+    @ViewBuilder private func sidebarContent(selection: Binding<String?>?) -> some View {
+#if os(macOS)
+        MacSessionList(
+            groups: sidebarGroups, sectionExpanded: workspace.projectSectionExpanded,
+            connected: client.connected, selection: workspace.selection, client: client,
+            activeProject: { workspace.activeProject }, toggleSection: setSectionExpanded,
+            toggleProject: discloseProject, activateProject: { project in
+                workspace.activeProject = project
+                if let id = workspace.selection, !client.directory.contains(id, in: project) { forgetSelection() }
+            },
+            select: selectSession, loadProject: loadProjectIfNeeded,
+            menuForProject: projectMenuItems, menuForSession: sessionMenuItems
+        )
+#elseif os(iOS)
+        if horizontalSizeClass == .compact {
+            PhoneSessionList(
+                groups: sidebarGroups, sectionExpanded: workspace.projectSectionExpanded, client: client,
+                activeProject: { workspace.activeProject },
+                toggleSection: { setSectionExpanded(!workspace.projectSectionExpanded) },
+                toggleProject: discloseProject, loadProject: loadProjectIfNeeded, select: selectSession,
+                menuForProject: projectMenuItems, menuForSession: sessionMenuItems,
+                refresh: refreshActiveProject
+            )
+        } else {
+            sidebarList(selection: selection)
+        }
+#else
+        sidebarList(selection: selection)
+#endif
+    }
+
+#if !os(macOS)
+    private func sidebarList(selection: Binding<String?>?) -> some View {
+        List(selection: selection) {
+            Section("项目", isExpanded: Binding(
+                get: { workspace.projectSectionExpanded },
+                set: { expanded in
+                    setSectionExpanded(expanded)
+                }
+            )) {
+                if projects.isEmpty {
+                    Text(client.connected ? "正在加载项目…" : "连接服务器后显示项目")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(projects) { project in
+                    projectRow(project)
+                }
+            }
+        }
+    }
+
+#endif
+
+#if os(iOS)
+    private func refreshActiveProject() async {
+        guard client.supportsSessionList, !workspace.managing, let project = workspace.activeProject else { return }
+        do { try await client.listSessions(in: project) }
+        catch { if client.connected && !Task.isCancelled { workspace.failure = error.localizedDescription } }
+    }
+#endif
+
+    private func loadProjectIfNeeded(_ project: ACPProject) async {
+        guard client.supportsSessionList, !client.directory.hasListed(project) else { return }
+        do { try await client.listSessions(in: project) }
+        catch { if client.connected && !Task.isCancelled { workspace.failure = error.localizedDescription } }
+    }
+
     private var workspaceLayout: some View {
         NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $workspace.preferredColumn) {
             projectSidebar(selection: $workspace.selection)
         } detail: {
             Group {
-                if let id = workspace.selection, let session = client.sessions.first(where: { $0.id == id }) {
+                if let id = workspace.selection, let session = client.directory.session(id: id) {
                     conversation(session)
                 } else {
                     if client.connected {
@@ -708,10 +779,12 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         }
 #endif
 #if os(macOS)
-        .overlayPreferenceValue(SessionPreviewAnchor.self) { anchor in
-            if let anchor, let session = client.sessions.first(where: { $0.id == hoveredSession }), sessionToDelete == nil {
+        .overlayPreferenceValue(SessionPreviewAnchor.self) { preview in
+            if let preview, sessionToDelete == nil {
+                let session = preview.session
                 GeometryReader { geometry in
-                    let row = geometry[anchor]
+                    let sidebar = geometry[preview.anchor]
+                    let row = preview.row.offsetBy(dx: sidebar.minX, dy: sidebar.minY)
                     VStack(alignment: .leading, spacing: 3) {
                         Text(session.title).font(.headline)
                         if !session.cwd.isEmpty {
@@ -848,11 +921,14 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
             catch { return }
             for project in visibleProjects {
                 guard !Task.isCancelled, client.connected else { return }
-                if !workspace.managing { try? await client.listSessions(in: project, titlesOnly: true) }
+                if !workspace.managing, client.directory.hasListed(project), !client.directory.rows(in: project).isEmpty {
+                    try? await client.listSessions(in: project, titlesOnly: true)
+                }
             }
         }
     }
 
+#if !os(macOS)
     private func projectRow(_ project: ACPProject) -> some View {
         let isExpanded = Binding(
             get: { workspace.expandedProjects.contains(project) },
@@ -860,97 +936,64 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 setProject(project, expanded: expanded)
                 if expanded {
                     workspace.activeProject = project
-                    if client.projectSessionIDs[project] == nil { refresh(project) }
                 }
             }
         )
         return DisclosureGroup(isExpanded: isExpanded) {
-            let sessions = client.sessions(in: project)
+            let sessions = client.directory.rows(in: project)
             if sessions.isEmpty {
                 Text("暂无会话").font(.callout).foregroundStyle(.secondary)
             }
             ForEach(sessions) { session in
-                Group {
-#if os(macOS)
-                    sessionRow(session).tag(session.id)
-#else
-                    NavigationLink(value: session.id) { sessionRow(session) }
-#endif
+                NavigationLink(value: session.id) {
+                    SessionListRow(session: session, client: client, workspace: workspace)
                 }
-                .contextMenu {
-                    if client.supportsSessionRename {
-                        Button("重命名会话…", systemImage: "pencil") {
-                            sessionName = session.title
-                            sessionToRename = session
-                        }
-                        .disabled(workspace.managing)
-                    }
-                    Button("删除会话", systemImage: "trash", role: .destructive) {
-                        sessionToDelete = session
-                    }
-                    .disabled(!client.supportsSessionDelete || workspace.managing || client.prompting.contains(session.id))
-                }
+                .contextMenu { menuButtons(sessionMenuItems(session)) }
             }
         } label: {
             Label(project.name, systemImage: workspace.activeProject == project ? "folder.fill" : "folder")
                 .lineLimit(1)
-#if os(macOS)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-                .gesture(TapGesture(count: 2).exclusively(before: TapGesture()).onEnded { tap in
-                    workspace.activeProject = project
-                    if let currentSession = workspace.selection,
-                       client.projectSessionIDs[project]?.contains(currentSession) != true {
-                        forgetSelection()
-                    }
-                    if case .first = tap { isExpanded.wrappedValue.toggle() }
-                })
-#endif
-                .help(project.path ?? "服务器默认项目")
-                .contextMenu {
-                    Button("新建会话", systemImage: "square.and.pencil") { createSession(in: project) }
-                        .disabled(workspace.managing)
-                    if client.supportsSessionList {
-                        Button("刷新会话", systemImage: "arrow.clockwise") { refresh(project) }
-                            .disabled(workspace.managing)
-                    }
-                    if project != workspace.defaultProject {
-                        Button("从侧边栏移除项目", systemImage: "minus.circle") { removeProject(project) }
-                            .disabled(workspace.managing)
-                    }
+                .task(id: isExpanded.wrappedValue) {
+                    if isExpanded.wrappedValue { await loadProjectIfNeeded(project) }
                 }
+                .help(project.path ?? "服务器默认项目")
+                .contextMenu { menuButtons(projectMenuItems(project)) }
         }
     }
 
-    private func sessionRow(_ session: ACPSession) -> some View {
-        let active = client.loaded.contains(session.id)
-        let approvalPending = client.permissions.contains { $0.sessionID == session.id }
-        return HStack(spacing: 10) {
-            Image(systemName: active ? "bubble.left.fill" : "bubble.left")
-                .foregroundStyle(workspace.selection == session.id ? Color.primary : Color.accentColor)
-                .frame(width: 22)
-                .accessibilityHidden(true)
-            Text(session.title).font(.body.weight(.medium)).lineLimit(1)
-            Spacer(minLength: 0)
-            if approvalPending {
-                Image(systemName: "lock.shield")
-                    .foregroundStyle(.orange)
-                    .accessibilityLabel("等待审批")
-            } else if client.prompting.contains(session.id) {
-                ProgressView().controlSize(.small).accessibilityLabel("正在回复")
-            }
-        }
-        .frame(minHeight: 26)
-        .contentShape(Rectangle())
-#if os(macOS)
-        .onHover { inside in
-            if inside { hoveredSession = session.id }
-            else if hoveredSession == session.id { hoveredSession = nil }
-        }
-        .anchorPreference(key: SessionPreviewAnchor.self, value: .bounds) {
-            hoveredSession == session.id ? $0 : nil
-        }
 #endif
+
+    private func projectMenuItems(_ project: ACPProject) -> [SidebarMenuItem] {
+        var items = [SidebarMenuItem("新建会话", "square.and.pencil", disabled: workspace.managing) { createSession(in: project) }]
+        if client.supportsSessionList {
+            items.append(SidebarMenuItem("刷新会话", "arrow.clockwise", disabled: workspace.managing) { refresh(project) })
+        }
+        if project != workspace.defaultProject {
+            items.append(SidebarMenuItem("从侧边栏移除项目", "minus.circle", disabled: workspace.managing) { removeProject(project) })
+        }
+        return items
+    }
+
+    private func sessionMenuItems(_ session: ACPSession) -> [SidebarMenuItem] {
+        var items: [SidebarMenuItem] = []
+        if client.supportsSessionRename {
+            items.append(SidebarMenuItem("重命名会话…", "pencil", disabled: workspace.managing) {
+                sessionName = session.title
+                sessionToRename = session
+            })
+        }
+        items.append(SidebarMenuItem("删除会话", "trash", destructive: true,
+                                     disabled: !client.supportsSessionDelete || workspace.managing || client.prompting.contains(session.id)) {
+            sessionToDelete = session
+        })
+        return items
+    }
+
+    private func menuButtons(_ items: [SidebarMenuItem]) -> some View {
+        ForEach(items, id: \.title) { item in
+            Button(item.title, systemImage: item.symbol, role: item.destructive ? .destructive : nil, action: item.perform)
+                .disabled(item.disabled)
+        }
     }
 
     private var serverBar: some View {
@@ -1154,32 +1197,24 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
             workspace.expandedProjects = SidebarExpansion.restore(server: client.address, projects: projects, defaultProject: project)
             let key = "acpLastSession." + client.address
             let last = UserDefaults.standard.dictionary(forKey: key) as? [String: String]
-            let lastProject = projects.first { $0.id == last?["project"] }
+            guard let last, let id = last["id"], let lastProject = projects.first(where: { $0.id == last["project"] }) else { return }
             let initial = workspace.selection
-            for visible in projects where workspace.expandedProjects.contains(visible) || visible == lastProject {
-                guard client.connected else { return }
-                do {
-                    try await client.listSessions(in: visible)
-                    if visible == lastProject, let id = last?["id"], workspace.selection == initial,
-                       client.connected {
-                        if client.projectSessionIDs[visible]?.contains(id) != true {
+            try await client.listSessions(in: lastProject)
+            guard client.connected, workspace.selection == initial else { return }
+            if !client.directory.contains(id, in: lastProject) {
 #if os(iOS)
-                            guard client.supportsSessionLoad else { continue }
-                            let saved = ACPSession(id: id, title: last?["title"] ?? "上次会话",
-                                                   cwd: last?["cwd"] ?? visible.path ?? "")
-                            try await client.restoreUnlistedSession(saved, in: visible)
-                            guard workspace.selection == initial, client.connected else { continue }
+                guard client.supportsSessionLoad else { return }
+                let saved = ACPSession(id: id, title: last["title"] ?? "上次会话", cwd: last["cwd"] ?? lastProject.path ?? "")
+                try await client.restoreUnlistedSession(saved, in: lastProject)
+                guard client.connected, workspace.selection == initial else { return }
 #else
-                            if client.supportsSessionList { UserDefaults.standard.removeObject(forKey: key) }
-                            continue
+                if client.supportsSessionList { UserDefaults.standard.removeObject(forKey: key) }
+                return
 #endif
-                        }
-                        workspace.activeProject = visible
-                        workspace.selection = id
-                        workspace.preferredColumn = .detail
-                    }
-                } catch { if client.connected { workspace.failure = error.localizedDescription } }
             }
+            workspace.activeProject = lastProject
+            workspace.selection = id
+            workspace.preferredColumn = .detail
         }
     }
 
@@ -1212,7 +1247,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         workspace.addedProjects.removeAll { $0 == project }
         setProject(project, expanded: false)
         if workspace.activeProject == project { workspace.activeProject = workspace.defaultProject }
-        if let selection = workspace.selection, client.projectSessionIDs[project]?.contains(selection) == true {
+        if let selection = workspace.selection, client.directory.contains(selection, in: project) {
             forgetSelection()
         }
         saveProjects()
@@ -1243,7 +1278,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
     private func openSelectedSession() {
         guard client.connected, client.supportsSessionLoad, let id = workspace.selection,
               !client.loaded.contains(id), workspace.sessionLoadFailure?.id != id,
-              let session = client.sessions.first(where: { $0.id == id }) else { return }
+              let session = client.directory.session(id: id) else { return }
         manage {
             guard client.connected, workspace.selection == id else { return }
             do {
@@ -1258,7 +1293,6 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
 
     private func conversation(_ session: ACPSession) -> some View {
         let id = session.id
-        let entries = client.entries[id] ?? []
         let isLoaded = client.loaded.contains(id)
         let isPrompting = client.prompting.contains(id)
         let permissions = client.permissions.filter { $0.sessionID == id }
@@ -1272,9 +1306,9 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         let horizontalMargin = ConversationLayout.horizontalMargin + settingsMargin + terminalMargin
 #endif
         return VStack(spacing: 0) {
-            if isLoaded {
+            if isLoaded, let timeline = client.timelines[id] {
                 SessionTranscript(
-                    entries: entries, isResponding: isPrompting, permissions: permissions,
+                    timeline: timeline, isResponding: isPrompting, permissions: permissions,
                     horizontalMargin: horizontalMargin, composerSpacing: ConversationLayout.composerSpacing
                 ) { permission, option in
                     run { try await client.respond(to: permission, option: option) }
@@ -1539,16 +1573,77 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
     }
 }
 
+struct SidebarProjectGroup {
+    let project: ACPProject
+    let expanded: Bool
+    let revision: UInt64
+    let rows: [ACPSession]
+    var visibleRowCount: Int { expanded ? 1 + max(1, rows.count) : 1 }
+}
+
+struct SidebarMenuItem {
+    let title: String
+    let symbol: String
+    let destructive: Bool
+    let disabled: Bool
+    let perform: () -> Void
+
+    init(_ title: String, _ symbol: String, destructive: Bool = false, disabled: Bool, perform: @escaping () -> Void) {
+        self.title = title
+        self.symbol = symbol
+        self.destructive = destructive
+        self.disabled = disabled
+        self.perform = perform
+    }
+}
+
+#if !os(macOS)
+private struct SessionListRow: View {
+    let session: ACPSession
+    let client: ACPClient
+    let workspace: ServerWorkspaceState
+
+    var body: some View {
+        let active = client.loaded.contains(session.id)
+        let approvalPending = client.permissions.contains { $0.sessionID == session.id }
+        return HStack(spacing: 10) {
+            Image(systemName: active ? "bubble.left.fill" : "bubble.left")
+                .foregroundStyle(workspace.selection == session.id ? Color.primary : Color.accentColor)
+                .frame(width: 22)
+                .accessibilityHidden(true)
+            Text(session.title).font(.body.weight(.medium)).lineLimit(1)
+            Spacer(minLength: 0)
+            if approvalPending {
+                Image(systemName: "lock.shield")
+                    .foregroundStyle(.orange)
+                    .accessibilityLabel("等待审批")
+            } else if client.prompting.contains(session.id) {
+                ProgressView().controlSize(.small).accessibilityLabel("正在回复")
+            }
+        }
+        .frame(minHeight: 26)
+        .contentShape(Rectangle())
+    }
+}
+
+#endif
+
 #Preview {
     ContentView()
         .environment(RemoteTerminalWindows())
 }
 
 #if os(macOS)
-private struct SessionPreviewAnchor: PreferenceKey {
-    static var defaultValue: Anchor<CGRect>? { nil }
+struct SessionPreviewAnchor: PreferenceKey {
+    struct Preview {
+        let session: ACPSession
+        let anchor: Anchor<CGRect>
+        let row: CGRect
+    }
 
-    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+    static var defaultValue: Preview? { nil }
+
+    static func reduce(value: inout Preview?, nextValue: () -> Preview?) {
         if let next = nextValue() { value = next }
     }
 }

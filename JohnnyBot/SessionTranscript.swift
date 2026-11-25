@@ -20,7 +20,7 @@ enum ConversationLayout {
 }
 
 struct SessionTranscript: View {
-    private let turns: [TranscriptTurn]
+    let timeline: TranscriptTimeline
     let isResponding: Bool
     let permissions: [ACPPermission]
     let horizontalMargin: CGFloat
@@ -29,12 +29,13 @@ struct SessionTranscript: View {
 
     @State private var position = ScrollPosition(edge: .bottom)
     @State private var showsJumpToLatest = false
+    @ScaledMetric(relativeTo: .body) private var textSize = ConversationLayout.transcriptTextSize
     @State private var markdownCache = TranscriptMarkdownCache()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    init(entries: [ACPEntry], isResponding: Bool, permissions: [ACPPermission], horizontalMargin: CGFloat,
+    init(timeline: TranscriptTimeline, isResponding: Bool, permissions: [ACPPermission], horizontalMargin: CGFloat,
          composerSpacing: CGFloat, respondToPermission: @escaping (ACPPermission, String?) -> Void) {
-        turns = TranscriptTurn.group(entries)
+        self.timeline = timeline
         self.isResponding = isResponding
         self.permissions = permissions
         self.horizontalMargin = horizontalMargin
@@ -63,11 +64,14 @@ struct SessionTranscript: View {
     private var messages: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 18) {
-                ForEach(turns) { turn in
+                ForEach(timeline.rows) { row in
                     TranscriptTurnRow(
-                        turn: turn, isLive: isResponding && turn.id == turns.last?.id,
+                        row: row, isLive: isResponding && row.id == timeline.rows.last?.id,
                         isAwaitingPermission: !permissions.isEmpty
                     )
+                    .onAppear {
+                        markdownCache.prefetch(around: row.index, in: timeline, size: textSize, streaming: isResponding)
+                    }
                 }
             }
             .frame(maxWidth: ConversationLayout.maxContentWidth)
@@ -82,8 +86,8 @@ struct SessionTranscript: View {
 #if os(iOS)
         .defaultScrollAnchor(.top, for: .alignment)
 #endif
-        .onChange(of: turns.count) { previousCount, count in
-            if count > previousCount, turns.last?.user != nil {
+        .onChange(of: timeline.rows.count) { previousCount, count in
+            if count > previousCount, timeline.rows.last?.turn.user != nil {
                 position.scrollTo(edge: .bottom)
             }
         }
@@ -106,7 +110,7 @@ struct SessionTranscript: View {
         }
 #endif
         .overlay {
-            if turns.isEmpty, !isResponding {
+            if timeline.rows.isEmpty, !isResponding {
                 ContentUnavailableView("开始对话", systemImage: "text.bubble",
                                        description: Text("向 Agent 发送一条消息。"))
                     .allowsHitTesting(false)
@@ -135,52 +139,9 @@ struct SessionTranscript: View {
     }
 }
 
-struct TranscriptTurn: Identifiable {
-    let id: UUID
-    let user: ACPEntry?
-    let entries: ArraySlice<ACPEntry>
-    let replyTiming: ACPReplyTiming?
-    let responseStart: Int
-
-    private init?(user: ACPEntry?, entries: ArraySlice<ACPEntry>) {
-        guard let id = user?.id ?? entries.first?.id else { return nil }
-        self.id = id
-        self.user = user
-        self.entries = entries
-        replyTiming = entries.reversed().lazy.compactMap(\.replyTiming).first ?? user?.replyTiming
-        responseStart = Self.startOfResponse(in: entries)
-    }
-
-    static func group(_ entries: [ACPEntry]) -> [Self] {
-        var turns: [Self] = []
-        var user: ACPEntry?
-        var start = entries.startIndex
-
-        for index in entries.indices where entries[index].kind == .user {
-            if let turn = Self(user: user, entries: entries[start..<index]) { turns.append(turn) }
-            user = entries[index]
-            start = index + 1
-        }
-        if let turn = Self(user: user, entries: entries[start...]) { turns.append(turn) }
-        return turns
-    }
-
-    private static func startOfResponse(in entries: ArraySlice<ACPEntry>) -> Int {
-        guard let lastWork = entries.lastIndex(where: {
-            $0.kind == .tool || $0.kind == .thought || $0.kind == .plan || $0.phase == .commentary
-        }) else { return entries.startIndex }
-
-        if let finalAnswer = entries.firstIndex(where: { $0.phase == .finalAnswer }) {
-            return finalAnswer
-        }
-
-        let afterWork = entries.index(after: lastWork)
-        return entries[afterWork...].lastIndex(where: { $0.kind == .agent }) ?? afterWork
-    }
-}
-
 private struct TranscriptTurnRow: View {
-    let turn: TranscriptTurn
+    let row: TranscriptTimeline.Row
+    private var turn: TranscriptTurn { row.turn }
     let isLive: Bool
     let isAwaitingPermission: Bool
 
@@ -384,17 +345,43 @@ private struct TranscriptMarkdown: View {
     let entryID: UUID
     let text: String
     let isStreaming: Bool
+    @State private var usedStreamingRenderer = false
 
     @ScaledMetric(relativeTo: .body) private var textSize = ConversationLayout.transcriptTextSize
 
     private static let defaultConfig = makeConfig(textSize: ConversationLayout.transcriptTextSize)
 
-    var body: some View {
-        let base = textSize == ConversationLayout.transcriptTextSize ? Self.defaultConfig : Self.makeConfig(textSize: textSize)
-        TranscriptMarkdownDocument(entryID: entryID, text: text, textSize: textSize, isStreaming: isStreaming, config: base)
-        .id(textSize)
-        .textSelection(.enabled)
+    static func config(for size: CGFloat) -> MarkdownRenderConfig {
+        size == ConversationLayout.transcriptTextSize ? defaultConfig : makeConfig(textSize: size)
+    }
 
+    // A single unmarked paragraph can be displayed immediately with system text.
+    // Route punctuation with Markdown, entity, URL or math semantics to the parser.
+    static func isPlainParagraph(_ text: String) -> Bool {
+        guard let first = text.first, !first.isWhitespace, text.last?.isWhitespace == false else { return false }
+        return text.rangeOfCharacter(from: markdownSyntax) == nil
+    }
+
+    private static let markdownSyntax = CharacterSet(charactersIn: "\n\r\t`*_~[]<>\\&$!#|{}:./=-@^+\u{2028}\u{2029}")
+
+    var body: some View {
+        content.onChange(of: isStreaming, initial: true) { _, live in
+            if live { usedStreamingRenderer = true }
+        }
+    }
+
+    @ViewBuilder private var content: some View {
+        if !isStreaming && !usedStreamingRenderer && Self.isPlainParagraph(text) {
+            Text(verbatim: text)
+                .font(.system(size: textSize))
+                .lineSpacing(5)
+                .textSelection(.enabled)
+        } else {
+            TranscriptMarkdownDocument(entryID: entryID, text: text, textSize: textSize,
+                                       isStreaming: isStreaming, config: Self.config(for: textSize))
+                .id(textSize)
+                .textSelection(.enabled)
+        }
     }
 
     private static func makeConfig(textSize: CGFloat) -> MarkdownRenderConfig {
@@ -502,14 +489,15 @@ private struct TranscriptMarkdownDocument: View {
                 let document: RenderableDocument
                 if let parsed, parsed.text == next.text {
                     document = parsed.document
-                } else if let cached = cache?.document(for: entryID, text: next.text, size: textSize) {
-                    document = cached
+                } else if !next.isStreaming, let cache {
+                    document = await cache.finishedDocument(for: entryID, text: next.text, size: textSize, config: config)
                 } else {
                     document = await parser.parse(text: next.text, config: config)
                 }
                 guard !Task.isCancelled else { break }
-                parsed = (next.text, document)
-                if !next.isStreaming {
+                if parsed?.text != next.text {
+                    parsed = (next.text, document)
+                } else if !next.isStreaming {
                     cache?.store(document, for: entryID, text: next.text, size: textSize)
                 }
             }
@@ -530,6 +518,53 @@ private final class TranscriptMarkdownCache {
     }
 
     private let entries = NSCache<NSString, Entry>()
+    private struct Job: Hashable {
+        let id: UUID
+        let text: String
+        let size: CGFloat
+    }
+    private var pending: [Job] = []
+    private var worker: Task<Void, Never>?
+    private var parsing: [Job: Task<RenderableDocument, Never>] = [:]
+
+    func finishedDocument(for id: UUID, text: String, size: CGFloat, config: MarkdownRenderConfig) async -> RenderableDocument {
+        if let document = document(for: id, text: text, size: size) { return document }
+        let job = Job(id: id, text: text, size: size)
+        if let task = parsing[job] { return await task.value }
+        let task = Task.detached(priority: Task.currentPriority) {
+            await MarkdownParserImpl().parse(text: text, config: config)
+        }
+        parsing[job] = task
+        let result = await task.value
+        parsing.removeValue(forKey: job)
+        store(result, for: id, text: text, size: size)
+        return result
+    }
+
+    func prefetch(around index: Int, in timeline: TranscriptTimeline, size: CGFloat, streaming: Bool) {
+        // Limit look-ahead to neighboring replies. Skip collapsed work, live
+        // output and stale requests left behind by a fast scroll.
+        for neighbor in [index - 1, index + 1, index - 2, index + 2] where timeline.rows.indices.contains(neighbor) {
+            if streaming && neighbor == timeline.rows.count - 1 { continue }
+            let turn = timeline.rows[neighbor].turn
+            for entry in turn.entries[turn.responseStart...].prefix(2) where entry.kind == .agent {
+                guard !TranscriptMarkdown.isPlainParagraph(entry.text),
+                      document(for: entry.id, text: entry.text, size: size) == nil,
+                      !pending.contains(where: { $0.id == entry.id && $0.size == size }) else { continue }
+                pending.append(Job(id: entry.id, text: entry.text, size: size))
+            }
+        }
+        if pending.count > 8 { pending.removeFirst(pending.count - 8) }
+        guard worker == nil, !pending.isEmpty else { return }
+        worker = Task(priority: .utility) { [weak self] in
+            while let self, !pending.isEmpty {
+                let job = pending.removeFirst()
+                _ = await finishedDocument(for: job.id, text: job.text, size: job.size, config: TranscriptMarkdown.config(for: job.size))
+            }
+            self?.worker = nil
+        }
+    }
+
 
     init() {
         entries.countLimit = 512
