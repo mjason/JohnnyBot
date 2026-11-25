@@ -478,8 +478,7 @@ final class ACPClient {
         followers[scope] = ScopeFollower(id: id, task: task)
     }
 
-    private func sync(_ scope: String) async throws {
-        guard let cache = replica else { throw ACPFailure(message: "会话缓存尚未打开") }
+    private func hydrate(_ scope: String, from cache: GoReplica) throws {
         let cursor = try cache.cursor(scope)
         if !cursor.epoch.isEmpty, cursor.epoch != epoch { try cache.clear(scope); resetProjection(scope) }
         if !hydrated.contains(scope) {
@@ -487,6 +486,11 @@ final class ACPClient {
             hydrated.insert(scope)
             applyEvents(history, scope: scope, replay: true)
         }
+    }
+
+    private func sync(_ scope: String) async throws {
+        guard let cache = replica else { throw ACPFailure(message: "会话缓存尚未打开") }
+        try hydrate(scope, from: cache)
         guard connected, let transport = broker else { return }
         if let task = pulling[scope] { return try await task.value }
         let task = Task {
@@ -757,6 +761,9 @@ final class ACPClient {
 
     func load(_ session: ACPSession) async throws {
         let scope = "thread/" + session.id
+        if let cache = replica, try cache.cursor(scope).epoch == epoch, !epoch.isEmpty {
+            try hydrate(scope, from: cache)
+        }
         if connected {
             do { try await command("thread.open", ["thread_id": session.id], write: true) }
             catch let error as ACPFailure where error.reason == "thread_busy" {

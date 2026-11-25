@@ -1381,7 +1381,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         let horizontalMargin = ConversationLayout.horizontalMargin + settingsMargin + terminalMargin
 #endif
         return VStack(spacing: 0) {
-            if isLoaded, let timeline = client.timelines[id] {
+            if let timeline = client.timelines[id], isLoaded || !timeline.rows.isEmpty {
                 SessionTranscript(
                     timeline: timeline, isResponding: isPrompting, permissions: permissions,
                     horizontalMargin: horizontalMargin, composerSpacing: ConversationLayout.composerSpacing
@@ -1394,6 +1394,8 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
 #endif
                 .id(id)
 
+            }
+            if isLoaded {
                 if let queue = client.queuedPrompts[id], !queue.isEmpty {
                     ForEach(queue) { message in
                         Label("待发送 · " + message.text, systemImage: "clock").font(.caption).lineLimit(2)
@@ -1428,6 +1430,8 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                     }
 #endif
                 }
+            } else if client.timelines[id]?.rows.isEmpty == false, workspace.sessionLoadFailure?.id != id {
+                ProgressView("正在更新会话…").controlSize(.small).padding(.vertical, 8)
             } else {
                 sessionOpeningStatus(for: id)
             }

@@ -29,6 +29,7 @@ struct SessionTranscript: View {
     let respondToPermission: (ACPPermission, String?) -> Void
 
     @State private var position = ScrollPosition(edge: .bottom)
+    @State private var historyStart: Int?
     @State private var showsJumpToLatest = false
     @ScaledMetric(relativeTo: .body) private var textSize = ConversationLayout.transcriptTextSize
     @State private var markdownCache = TranscriptMarkdownCache()
@@ -83,15 +84,25 @@ struct SessionTranscript: View {
     }
 
     private func messageScrollView(minHeight: CGFloat) -> some View {
-        ScrollView {
+        let start = min(historyStart ?? max(0, timeline.entryCount - TranscriptTimeline.pageSize),
+                        max(0, timeline.entryCount - 1))
+        let visible = timeline.visibleRows(from: start)
+        return ScrollView {
             LazyVStack(alignment: .leading, spacing: 18) {
-                ForEach(timeline.rows) { row in
+                if start > 0 {
+                    Button("加载更早的消息") {
+                        historyStart = max(0, start - TranscriptTimeline.pageSize)
+                    }
+                    .buttonStyle(.borderless)
+                    .frame(maxWidth: .infinity)
+                }
+                ForEach(visible) { row in
                     TranscriptTurnRow(
-                        row: row, isLive: isResponding && row.id == timeline.rows.last?.id,
+                        row: row, timeline: timeline, start: start, isLive: isResponding && row.id == timeline.rows.last?.id,
                         isAwaitingPermission: !permissions.isEmpty
                     )
                     .onAppear {
-                        markdownCache.prefetch(around: row.index, in: timeline, size: textSize, streaming: isResponding)
+                        markdownCache.prefetch(around: row.index, in: timeline, from: start, size: textSize, streaming: isResponding)
                     }
                 }
             }
@@ -110,13 +121,14 @@ struct SessionTranscript: View {
         .scrollBounceBehavior(.basedOnSize, axes: .vertical)
 #endif
         .onChange(of: timeline.rows.count) { previousCount, count in
-            if count > previousCount, timeline.rows.last?.turn.user != nil {
+            if count > previousCount, !showsJumpToLatest, timeline.rows.last?.turn.user != nil {
                 position.scrollTo(edge: .bottom)
             }
         }
         .onScrollGeometryChange(for: Bool.self) { geometry in
             geometry.contentSize.height > geometry.visibleRect.maxY + 90
         } action: { _, awayFromBottom in
+            if awayFromBottom, historyStart == nil, start > 0 { historyStart = start }
             showsJumpToLatest = awayFromBottom
         }
         .scrollEdgeEffectStyle(.soft, for: .bottom)
@@ -155,7 +167,8 @@ struct SessionTranscript: View {
 
 private struct TranscriptTurnRow: View {
     let row: TranscriptTimeline.Row
-    private var turn: TranscriptTurn { row.turn }
+    let timeline: TranscriptTimeline
+    let start: Int
     let isLive: Bool
     let isAwaitingPermission: Bool
 
@@ -163,6 +176,7 @@ private struct TranscriptTurnRow: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        let turn = timeline.visibleTurn(row, from: start)
         let responseStart = turn.responseStart
         let isExpanded = expansionOverride ?? isLive
         let hasCancelStatus = turn.entries.last?.kind == .status
@@ -231,7 +245,7 @@ private struct TranscriptTurnRow: View {
         ForEach(TranscriptBlock.group(entries)) { block in
             switch block {
             case .message(let entry):
-                TranscriptEntryRow(entry: entry, isStreaming: isLive && turn.entries.last?.id == entry.id,
+                TranscriptEntryRow(entry: entry, isStreaming: isLive && row.turn.entries.last?.id == entry.id,
                                    showAgentLabel: showAgentLabel)
             case .tools(_, let calls):
                 TranscriptToolGroup(calls: calls, isLive: isLive)
@@ -627,12 +641,12 @@ private final class TranscriptMarkdownCache {
         return result
     }
 
-    func prefetch(around index: Int, in timeline: TranscriptTimeline, size: CGFloat, streaming: Bool) {
+    func prefetch(around index: Int, in timeline: TranscriptTimeline, from start: Int, size: CGFloat, streaming: Bool) {
         // Limit look-ahead to neighboring replies. Skip collapsed work, live
         // output and stale requests left behind by a fast scroll.
-        for neighbor in [index - 1, index + 1, index - 2, index + 2] where timeline.rows.indices.contains(neighbor) {
+        for neighbor in [index - 1, index + 1, index - 2, index + 2] where timeline.visibleRows(from: start).indices.contains(neighbor) {
             if streaming && neighbor == timeline.rows.count - 1 { continue }
-            let turn = timeline.rows[neighbor].turn
+            let turn = timeline.visibleTurn(timeline.rows[neighbor], from: start)
             for entry in turn.entries[turn.responseStart...].prefix(2) where entry.kind == .agent {
                 guard !TranscriptMarkdown.isPlainParagraph(entry.text),
                       document(for: entry.id, text: entry.text, size: size) == nil,

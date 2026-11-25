@@ -3,6 +3,22 @@ import Testing
 
 @MainActor
 struct TranscriptTimelineTests {
+    @Test func historyPagesCountEntriesAcrossTurnBoundaries() {
+        let timeline = TranscriptTimeline()
+        let history = (0..<253).map { i in
+            ACPEntry(kind: i == 0 || i == 200 ? .user : .agent, text: String(i))
+        }
+        timeline.replace(history)
+        #expect(timeline.entryCount == history.count)
+        for start in [153, 53, 0] {
+            let page = timeline.visibleRows(from: start).flatMap { row in
+                let turn = timeline.visibleTurn(row, from: start)
+                return [turn.user].compactMap { $0 } + Array(turn.entries)
+            }
+            #expect(page.map(\.id) == history[start...].map(\.id))
+        }
+    }
+
     @Test func flushCombinesNewTurnsAndLateToolUpdates() {
         let timeline = TranscriptTimeline()
         var entries = [ACPEntry(kind: .user, text: "first"), ACPEntry(kind: .tool, text: "running")]

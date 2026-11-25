@@ -52,31 +52,86 @@ final class TranscriptTimeline {
     @Observable final class Row: Identifiable {
         let id: UUID
         let index: Int
-        var turn: TranscriptTurn
-        init(_ turn: TranscriptTurn, index: Int) { id = turn.id; self.index = index; self.turn = turn }
+        private var current: TranscriptTurn?
+        @ObservationIgnored private var historicalEntries: ArraySlice<ACPEntry>?
+
+        var turn: TranscriptTurn {
+            get {
+                if let current { return current }
+                if let historicalTurn { return historicalTurn }
+                let value = TranscriptTimeline.turn(historicalEntries!)
+                historicalTurn = value
+                historicalEntries = nil
+                return value
+            }
+            set {
+                current = newValue
+                historicalTurn = nil
+                historicalEntries = nil
+            }
+        }
+
+        // Multiple historical rows share the immutable array from the initial replay.
+        // Only a row that enters the transcript window builds its grouped content.
+        @ObservationIgnored private var historicalTurn: TranscriptTurn?
+
+        func suffix(skipping count: Int) -> TranscriptTurn {
+            if count <= 0 { return turn }
+            if current == nil, let history = historicalEntries, count < history.count {
+                return TranscriptTimeline.turn(history.dropFirst(count))
+            }
+            let full = turn
+            let skip = count - (full.user == nil ? 0 : 1)
+            return TranscriptTurn(user: nil, entries: full.entries.dropFirst(skip)) ?? full
+        }
+
+        init(_ turn: TranscriptTurn, index: Int) {
+            id = turn.id
+            self.index = index
+            current = turn
+        }
+
+        init(history: ArraySlice<ACPEntry>, index: Int) {
+            id = history.first!.id
+            self.index = index
+            historicalEntries = history
+        }
     }
 
     private(set) var rows: [Row] = []
     @ObservationIgnored private var rowForOffset: [Int] = []
     @ObservationIgnored private var starts: [Int] = []
 
+    static let pageSize = 100
+
+    private(set) var entryCount = 0
+
+    func visibleRows(from offset: Int) -> ArraySlice<Row> {
+        guard rowForOffset.indices.contains(offset) else { return [] }
+        return rows[rowForOffset[offset]...]
+    }
+
+    func visibleTurn(_ row: Row, from offset: Int) -> TranscriptTurn {
+        guard starts.indices.contains(row.index) else { return row.turn }
+        return row.suffix(skipping: offset - starts[row.index])
+    }
+
     func replace(_ history: [ACPEntry]) {
-        var newRows: [Row] = []
-        var newStarts: [Int] = []
+        starts = history.indices.filter { $0 == 0 || history[$0].kind == .user }
         var offsets: [Int] = []
         offsets.reserveCapacity(history.count)
-        for turn in TranscriptTurn.group(history) {
-            newStarts.append(offsets.count)
-            let count = turn.entries.count + (turn.user == nil ? 0 : 1)
-            offsets.append(contentsOf: repeatElement(newRows.count, count: count))
-            newRows.append(Row(turn, index: newRows.count))
+        rows = starts.indices.map { index in
+            let end = index + 1 < starts.count ? starts[index + 1] : history.count
+            let range = starts[index]..<end
+            offsets.append(contentsOf: repeatElement(index, count: range.count))
+            return Row(history: history[range], index: index)
         }
-        starts = newStarts
         rowForOffset = offsets
-        rows = newRows
+        entryCount = history.count
     }
 
     func update(_ history: [ACPEntry], at offset: Int) {
+        defer { entryCount = history.count }
         if offset == rowForOffset.count && history.count == offset + 1 {
             if rows.isEmpty || history[offset].kind == .user {
                 starts.append(offset)
@@ -95,6 +150,8 @@ final class TranscriptTimeline {
     }
 
     func update(_ history: [ACPEntry], changedOffsets: Set<Int>) {
+        defer { entryCount = history.count }
+        if rows.isEmpty, history.count > Self.pageSize { replace(history); return }
         if changedOffsets.count == 1, let offset = changedOffsets.first {
             update(history, at: offset)
             return
