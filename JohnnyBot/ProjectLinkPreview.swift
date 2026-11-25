@@ -144,9 +144,9 @@ private struct ProjectFilePreview: View {
     @State private var position = CodeEditor.Position()
 
     private var language: LanguageConfiguration? {
-        switch (file.path as NSString).pathExtension.lowercased() {
+        switch previewHighlightLanguage(for: file.path) {
         case "swift": .swift()
-        case "py": .python()
+        case "python": .python()
         case "sql": .sqlite()
         case "hs": .haskell()
         case "agda": .agda()
@@ -199,6 +199,36 @@ private struct ProjectFilePreview: View {
     }
 }
 
+func previewHighlightLanguage(for path: String) -> String {
+    let filename = (path as NSString).lastPathComponent.lowercased()
+    switch filename {
+    case "dockerfile", "containerfile": return "dockerfile"
+    case "makefile", "gnumakefile": return "makefile"
+    case ".bashrc", ".zshrc", ".zprofile", ".profile": return "bash"
+    case ".editorconfig", ".gitconfig", ".gitmodules": return "ini"
+    case ".prettierrc", ".eslintrc", ".babelrc": return "yaml"
+    default: break
+    }
+
+    let ext = (filename as NSString).pathExtension
+    switch ext {
+    case "py", "pyi", "pyw": return "python"
+    case "toml", "ini", "cfg": return "ini" // Highlight.js shares a grammar for TOML and INI.
+    case "json", "jsonc", "jsonl", "ndjson", "ipynb": return "json"
+    case "yaml", "yml": return "yaml"
+    case "rs": return "rust"
+    case "ts", "tsx", "mts", "cts": return "typescript"
+    case "js", "jsx", "mjs", "cjs": return "javascript"
+    case "sh", "bash", "zsh": return "bash"
+    case "h", "hpp", "cc", "cxx": return "cpp"
+    case "m", "mm": return "objectivec"
+    case "html", "htm", "xml", "svg", "plist", "vue", "svelte": return "xml"
+    case "md", "markdown": return "markdown"
+    case "proto": return "protobuf"
+    default: return ext
+    }
+}
+
 private struct HighlightedFile: View {
     let source: String
     let path: String
@@ -206,23 +236,10 @@ private struct HighlightedFile: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var highlighted: AttributedString?
 
-    private var alias: String {
-        let filename = (path as NSString).lastPathComponent.lowercased()
-        switch filename {
-        case "dockerfile", "containerfile": return "dockerfile"
-        case "makefile", "gnumakefile": return "makefile"
-        case ".bashrc", ".zshrc", ".zprofile": return "bash"
-        default:
-            let ext = (filename as NSString).pathExtension
-            return ["rs": "rust", "ts": "typescript", "tsx": "typescript", "js": "javascript", "jsx": "javascript",
-                    "h": "cpp", "m": "objectivec", "mm": "objectivec", "zsh": "bash",
-                    "vue": "xml", "svelte": "xml", "jsonc": "json"][ext] ?? ext
-        }
-    }
-
     var body: some View {
         HighlightedFileText(text: highlighted ?? AttributedString(source), line: line)
             .task(id: colorScheme) {
+                let alias = previewHighlightLanguage(for: path)
                 guard !alias.isEmpty, source.utf8.count <= 512 * 1024,
                       !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
                 let result = try? await highlightSource(source, language: alias, colorScheme: colorScheme)

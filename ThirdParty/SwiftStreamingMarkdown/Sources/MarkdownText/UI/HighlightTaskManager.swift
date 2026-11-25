@@ -57,5 +57,14 @@ actor HighlightTaskManager: ObservableObject {
 
 /// Highlights source on a light or dark editor background.
 public func highlightSource(_ code: String, language: String, colorScheme: ColorScheme) async throws -> AttributedString {
-  try await HighlightTaskManager.highlight(code, language: language, colors: CodeBlockConfig.Theme.xcode.highlightColors(for: colorScheme))
+  let colors = CodeBlockConfig.Theme.xcode.highlightColors(for: colorScheme)
+  let styled = try await HighlightTaskManager.highlight(code, language: language, colors: colors)
+  let rendered = String(styled.characters)
+  // The HTML decoder trims leading and trailing whitespace. Restore it for file previews.
+  guard let range = code.range(of: rendered, options: .literal),
+        code[..<range.lowerBound].allSatisfy(\.isWhitespace),
+        code[range.upperBound...].allSatisfy(\.isWhitespace) else {
+    return AttributedString(code)
+  }
+  return AttributedString(String(code[..<range.lowerBound])) + styled + AttributedString(String(code[range.upperBound...]))
 }
