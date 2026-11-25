@@ -3,12 +3,14 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     private struct Server: Identifiable {
-        let id = UUID()
+        var id = UUID()
+        var name = ""
         let client: ACPClient
         let workspace = ServerWorkspaceState()
 
-        var label: String {
-            client.address.isEmpty ? "新服务器" : client.address
+        var label: String { name.isEmpty ? client.displayName : name }
+        var settings: [String: String] {
+            ["id": id.uuidString, "address": client.address, "name": name]
         }
     }
 
@@ -16,16 +18,23 @@ struct ContentView: View {
     @State private var servers: [Server]
 
     init() {
-        let saved = UserDefaults.standard.stringArray(forKey: "mqttServerAddresses") ?? [ACPClient.defaultAddress]
-        let addresses = saved.isEmpty ? [""] : saved
-        let restored = addresses.map { address in
-            Server(client: ACPClient(address: address, fingerprint: UserDefaults.standard.string(forKey: "goPin." + address) ?? ""))
-
+        let defaults = UserDefaults.standard
+        let saved = defaults.array(forKey: "mqttServerTabs") as? [[String: String]]
+        let legacy = defaults.stringArray(forKey: "mqttServerAddresses") ?? [ACPClient.defaultAddress]
+        let records = saved ?? legacy.map { ["address": $0] }
+        let restored = (records.isEmpty ? [["address": ""]] : records).map { record in
+            let address = record["address"] ?? ""
+            return Server(id: record["id"].flatMap(UUID.init(uuidString:)) ?? UUID(), name: record["name"] ?? "",
+                          client: ACPClient(address: address, fingerprint: defaults.string(forKey: "goPin." + address) ?? ""))
         }
         _servers = State(initialValue: restored)
-        let selected = UserDefaults.standard.string(forKey: "mqttSelectedServerAddress")
-        _selectedServer = State(initialValue: restored.first { $0.client.address == selected }?.id)
+        let selectedID = defaults.string(forKey: "mqttSelectedServerTab").flatMap(UUID.init(uuidString:))
+        let selectedAddress = defaults.string(forKey: "mqttSelectedServerAddress")
+        let selected = restored.first { $0.id == selectedID } ?? restored.first { $0.client.address == selectedAddress }
+        _selectedServer = State(initialValue: selected?.id ?? restored[0].id)
     }
+    @State private var renameTarget: UUID?
+    @State private var nameDraft = ""
     @State private var selectedServer: UUID?
     @State private var confirmingRemoval = false
     @State private var pendingRemoval: UUID?
@@ -54,6 +63,7 @@ struct ContentView: View {
 #endif
             ServerWorkspace(
                 client: current.client,
+                serverName: current.label,
                 workspace: current.workspace,
                 columns: $columns,
                 removeServer: { requestClose(current, confirmRemoval: true) }
@@ -77,12 +87,28 @@ struct ContentView: View {
         .onDisappear {
             for server in servers { server.client.disconnect() }
         }
-        .onChange(of: current.client.address) { _, address in
-            if !address.isEmpty { UserDefaults.standard.set(address, forKey: "mqttSelectedServerAddress") }
+        .onChange(of: current.id, initial: true) { _, id in
+            UserDefaults.standard.set(id.uuidString, forKey: "mqttSelectedServerTab")
         }
-        .onChange(of: servers.map { $0.client.address }) { _, addresses in
-            let saved = addresses.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
-            UserDefaults.standard.set(saved, forKey: "mqttServerAddresses")
+        .onChange(of: servers.map(\.settings), initial: true) { _, records in
+            let saved = records.filter { $0["address"] != "" || $0["name"] != "" }
+            UserDefaults.standard.set(saved, forKey: "mqttServerTabs")
+        }
+        .alert("重命名服务器标签", isPresented: Binding(
+            get: { renameTarget != nil },
+            set: { if !$0 { renameTarget = nil } }
+        ), presenting: servers.first { $0.id == renameTarget }) { server in
+            TextField(server.client.displayName, text: $nameDraft)
+                .accessibilityLabel("标签名称")
+            Button("保存") {
+                if let index = servers.firstIndex(where: { $0.id == server.id }) {
+                    servers[index].name = nameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+            .keyboardShortcut(.defaultAction)
+            Button("取消", role: .cancel) {}
+        } message: { server in
+            Text(server.client.address.isEmpty ? "名称留空时使用默认名称。" : "\(server.client.address)\n名称留空时显示服务器地址。")
         }
         .confirmationDialog("移除服务器？", isPresented: $confirmingRemoval, titleVisibility: .visible) {
             Button("移除服务器", role: .destructive, action: removeTab)
@@ -99,11 +125,12 @@ struct ContentView: View {
             Picker("当前服务器", selection: Binding(get: { current.id }, set: { selectedServer = $0 })) {
                 ForEach(servers) { server in
                     let pending = server.client.permissions.count
-                    Text(pending == 0 ? server.client.displayName : "\(server.client.displayName) · \(pending) 项待审批")
+                    Text(pending == 0 ? server.label : "\(server.label) · \(pending) 项待审批")
                         .tag(server.id)
                 }
             }
             .pickerStyle(.inline)
+            renameButton(current)
             Button("添加服务器", systemImage: "plus", action: addServer)
             if current.client.available {
                 Button("断开连接", systemImage: "power", role: .destructive) {
@@ -119,7 +146,7 @@ struct ContentView: View {
         } label: {
             Label("切换服务器", systemImage: "server.rack")
         }
-        .accessibilityValue(current.client.displayName)
+        .accessibilityValue(current.label)
     }
 #endif
 
@@ -171,7 +198,7 @@ struct ContentView: View {
         let showsClose = selected
 #endif
         let pending = server.client.permissions.count
-        let title = server.client.offline ? server.client.status : server.client.displayName
+        let title = server.client.offline ? "离线 · " + server.label : server.label
 
         return HStack(spacing: 0) {
             if servers.count > 1 {
@@ -216,7 +243,21 @@ struct ContentView: View {
             .buttonStyle(.plain)
             .accessibilityAddTraits(selected ? .isSelected : [])
             .accessibilityValue(server.client.connected ? "已连接" : "未连接")
-            .help(server.label)
+            .help(server.client.address.isEmpty ? server.label : server.client.address)
+            .contextMenu {
+                renameButton(server)
+                if server.client.available {
+                    Button("断开连接", systemImage: "power", role: .destructive) {
+                        UserDefaults.standard.set(true, forKey: "acpManuallyDisconnected." + server.client.address)
+                        server.client.disconnect()
+                    }
+                }
+                if servers.count > 1 {
+                    Button("关闭标签页", systemImage: "xmark") {
+                        requestClose(server)
+                    }
+                }
+            }
         }
         .font(.callout.weight(selected ? .semibold : .regular))
         .foregroundStyle(selected ? .primary : .secondary)
@@ -229,18 +270,12 @@ struct ContentView: View {
                 hoveredTab = nil
             }
         }
-        .contextMenu {
-            if server.client.available {
-                Button("断开连接", systemImage: "power", role: .destructive) {
-                    UserDefaults.standard.set(true, forKey: "acpManuallyDisconnected." + server.client.address)
-                    server.client.disconnect()
-                }
-            }
-            if servers.count > 1 {
-                Button("关闭标签页", systemImage: "xmark") {
-                    requestClose(server)
-                }
-            }
+    }
+
+    private func renameButton(_ server: Server) -> some View {
+        Button("重命名标签…", systemImage: "pencil") {
+            nameDraft = server.name
+            renameTarget = server.id
         }
     }
 
@@ -318,6 +353,7 @@ private final class ServerWorkspaceState {
 
 private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
     let client: ACPClient
+    let serverName: String
     @Bindable var workspace: ServerWorkspaceState
     @Binding var columns: NavigationSplitViewVisibility
     let removeServer: () -> Void
@@ -522,7 +558,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         .listStyle(.sidebar)
 #if os(iOS)
         .navigationTitle("会话")
-        .navigationSubtitle(client.displayName)
+        .navigationSubtitle(serverName)
         .refreshable { await refreshActiveProject() }
         .toolbar {
             ToolbarItem(placement: .topBarLeading) { header() }

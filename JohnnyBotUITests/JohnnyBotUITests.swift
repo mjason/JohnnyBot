@@ -37,7 +37,7 @@ final class JohnnyBotUITests: XCTestCase {
     @MainActor
     func testPhoneConnectionRequiresAddressAndFingerprint() throws {
         let app = XCUIApplication()
-        app.launchArguments = ["-mqttServerAddresses", "()"]
+        app.launchArguments = ["-mqttServerTabs", "()"]
         app.launch()
 
         let connect = app.buttons["连接服务器"]
