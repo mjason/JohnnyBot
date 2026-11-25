@@ -111,6 +111,43 @@ struct JohnnyBotTests {
         #expect(client.timelines["partial"]?.entryCount == 1)
     }
 
+    @Test func replaysACPv2ChildInItsOwnActivity() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let client = ACPClient(address: "mqtts://localhost:8883/test", fingerprint: "test-pin")
+        let identity = DeviceIdentity(key: .init())
+        let name = [client.address, client.fingerprint, identity.id].joined(separator: "\n")
+        let epochKey = "goEpoch." + name
+        UserDefaults.standard.set("one", forKey: epochKey)
+        defer { UserDefaults.standard.removeObject(forKey: epochKey) }
+        let cache = try GoReplica(name: name, directory: directory)
+        let updates: [(String, [String: Any])] = [
+            ("root", ["sessionUpdate": "user_message", "messageId": "1", "content": [["text": "request"]]]),
+            ("root", ["sessionUpdate": "subagent_update", "sessionId": "child", "title": "Investigator"]),
+            ("child", ["sessionUpdate": "agent_message_chunk", "messageId": "2", "content": ["text": "draft"]]),
+            ("child", ["sessionUpdate": "agent_message", "messageId": "2", "content": [["text": "finding"]]]),
+            ("child", ["sessionUpdate": "state_update", "state": "idle"]),
+            ("root", ["sessionUpdate": "agent_message", "messageId": "2", "content": [["text": "answer"]]])
+        ]
+        let events = updates.enumerated().map { offset, item -> [String: Any] in
+            ["seq": Int64(offset + 1), "kind": "acp.history", "data": ["protocolVersion": 2,
+             "rootSessionId": "root", "sessionId": item.0, "update": item.1] as [String: Any]]
+        }
+        let scope = "thread/root"
+        _ = try cache.apply(["epoch": "one", "scope": scope, "after": Int64(0), "through": Int64(events.count),
+                             "more": false, "events": events], scope: scope, expected: .init(), epoch: "one")
+        try client.prepareReplica(identity: identity, directory: directory)
+        try client.restoreCachedTranscript("root")
+        let turn = try #require(client.timelines["root"]?.rows.first?.turn)
+        #expect(turn.user?.text == "request")
+        #expect(turn.entries.map(\.text) == ["Investigator", "answer"])
+        let child = try #require(turn.entries.first)
+        #expect(child.toolStatus == "completed")
+        #expect(child.toolContent.count == 1)
+        if case let .text(value) = child.toolContent.first { #expect(value == "finding") }
+        else { Issue.record("Missing child response") }
+    }
+
     @Test func groupsIntermediateWorkWithoutHidingTheFinalResponse() throws {
         let turns = TranscriptTurn.group([
             ACPEntry(kind: .user, text: "First request"),

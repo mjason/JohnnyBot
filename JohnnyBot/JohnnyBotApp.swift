@@ -50,6 +50,8 @@ struct JohnnyBotApp: App {
 #if DEBUG && targetEnvironment(simulator)
             if CommandLine.arguments.contains("-testHistoryPagination") {
                 PaginationTestTranscript()
+            } else if CommandLine.arguments.contains("-testSteeringComposer") {
+                SteeringTestComposer()
             } else {
                 ContentView().environment(terminals)
             }
@@ -198,6 +200,17 @@ struct TerminalWindowRestoreFrame {
 #endif
 
 #if DEBUG && targetEnvironment(simulator)
+private struct SteeringTestComposer: View {
+    @State private var draft = "补充说明"
+    @State private var active = true
+    var body: some View {
+        SessionComposer(draft: $draft, attachments: [], supportsImages: false, supportsFiles: false,
+                        commands: [], isPrompting: active, canSteer: true, isManaging: false,
+                        horizontalMargin: 16, send: { draft = "" }, stop: { active = false },
+                        addAttachments: { _ in }, removeAttachment: { _ in }, attachmentFailed: { _ in })
+    }
+}
+
 private struct PaginationTestTranscript: View {
     @State private var timeline = TranscriptTimeline()
 

@@ -1427,7 +1427,8 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                         supportsFiles: client.supportsPromptFiles,
                         commands: options?.commands ?? [],
                         isPrompting: isPrompting,
-                        isManaging: workspace.managing || client.isArchived(id) || client.submitting.contains(id),
+                        canSteer: client.steeringTarget(in: id) != nil,
+                        isManaging: workspace.managing || client.isArchived(id) || !client.canSubmit(in: id),
                         horizontalMargin: horizontalMargin,
                         send: { sendDraft(in: id) },
                         stop: { run { try await client.cancelPrompt(in: id) } },
@@ -1540,7 +1541,8 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         let attachments = workspace.draftAttachments[id, default: []]
         let command = ACPCommand.commandText(in: text)
         guard !text.isEmpty || !attachments.isEmpty, command != "/", client.loaded.contains(id),
-              !client.prompting.contains(id), !client.submitting.contains(id), !workspace.managing else { return }
+              client.canSubmit(in: id), !client.isArchived(id), !workspace.managing else { return }
+        let steeringTurn = client.steeringTarget(in: id)
         let invocation = command?.prefix { !$0.isWhitespace } ?? ""
         let isKnownCommand = client.sessionOptions[id]?.commands.contains { $0.invocation == invocation } == true
         let prompt = isKnownCommand ? command ?? text : text
@@ -1548,7 +1550,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         workspace.draftAttachments[id] = []
         run {
             do {
-                try await client.prompt(prompt, attachments: attachments, in: id)
+                try await client.prompt(prompt, attachments: attachments, in: id, steeringTurn: steeringTurn)
             } catch {
                 let nextDraft = workspace.drafts[id, default: ""]
                 workspace.drafts[id] = [draft, nextDraft].filter { !$0.isEmpty }.joined(separator: "\n\n")

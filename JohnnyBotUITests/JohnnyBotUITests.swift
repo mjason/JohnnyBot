@@ -35,6 +35,22 @@ final class JohnnyBotUITests: XCTestCase {
 
 #if os(iOS)
     @MainActor
+    func testSteeringKeepsStopAvailable() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["-testSteeringComposer"]
+        app.launch()
+        let steer = app.buttons["追加到当前回复"]
+        let stop = app.buttons["停止回复"]
+        XCTAssertTrue(steer.waitForExistence(timeout: 5))
+        XCTAssertTrue(stop.isHittable)
+        steer.tap()
+        XCTAssertFalse(steer.exists)
+        XCTAssertTrue(stop.isHittable)
+        stop.tap()
+        XCTAssertFalse(stop.exists)
+    }
+
+    @MainActor
     func testSeamlessHistoryOnPhone() throws {
         let app = XCUIApplication()
         app.launchArguments = ["-testHistoryPagination"]

@@ -11,6 +11,7 @@ struct SessionComposer: View {
     let supportsFiles: Bool
     let commands: [ACPCommand]
     let isPrompting: Bool
+    let canSteer: Bool
     let isManaging: Bool
     let horizontalMargin: CGFloat
     let send: () -> Void
@@ -159,18 +160,19 @@ struct SessionComposer: View {
                     .buttonStyle(ComposerSendStyle())
                     .accessibilityLabel("停止回复")
                     .help("停止回复")
-            } else if canSend {
+            }
+            if canSend && (!isPrompting || canSteer) {
                 Button(action: send) { icon("arrow.up.circle") }
                     .buttonStyle(ComposerSendStyle())
-                    .accessibilityLabel("发送")
+                    .accessibilityLabel(isPrompting ? "追加到当前回复" : "发送")
                     .keyboardShortcut(.return, modifiers: .command)
 #if os(iOS)
-                    .help("发送消息")
+                    .help(isPrompting ? "追加到当前回复" : "发送消息")
 #else
-                    .help("发送消息（↩），换行（⇧↩）")
+                    .help(isPrompting ? "追加到当前回复（↩）" : "发送消息（↩），换行（⇧↩）")
 #endif
                     .disabled(isManaging)
-            } else {
+            } else if !isPrompting {
                 Button {
                     dismissedQuery = nil
                     draft = "/"

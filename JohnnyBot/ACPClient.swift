@@ -76,6 +76,7 @@ struct ACPEntry: Identifiable {
     var toolKind: String?
     var toolStatus: String?
     var toolContent: [ToolContent] = []
+    var childContentIndexes: [String: Int] = [:]
     var toolLocations: [ToolLocation] = []
     var planSteps: [PlanStep] = []
     var attachments: [ACPAttachment.Preview] = []
@@ -160,6 +161,20 @@ final class ACPClient {
     private(set) var loaded: Set<String> = []
     private var confirmedThreads: Set<String> = []
     private(set) var submitting: Set<String> = []
+    private var steerableTurns: [String: String] = [:]
+    private var steering: [String: String] = [:]
+
+    func steeringTarget(in id: String) -> String? {
+        guard prompting.contains(id), let turn = turns[id], steerableTurns[id] == turn else { return nil }
+        return turn
+    }
+
+    func canSubmit(in id: String) -> Bool {
+        guard loaded.contains(id), !awaitingTurnStatus(id), steering[id] == nil else { return false }
+        if prompting.contains(id) { return steeringTarget(in: id) != nil }
+        return !submitting.contains(id)
+    }
+
     var prompting: Set<String> { connected ? confirmedThreads.intersection(turns.keys) : [] }
 
     func awaitingTurnStatus(_ id: String) -> Bool {
@@ -333,6 +348,8 @@ final class ACPClient {
         confirmedThreads.removeAll()
         submitting.removeAll()
         turns.removeAll()
+        steerableTurns.removeAll()
+        steering.removeAll()
         sendStarted.removeAll()
         timings.removeAll()
         recordedPermissions.removeAll()
@@ -352,8 +369,9 @@ final class ACPClient {
     }
 
     @discardableResult
-    func command(_ op: String, _ fields: [String: Any] = [:], write: Bool = false, durable: Bool = false) async throws -> [String: Any] {
-        let id = UUID().uuidString.lowercased()
+    func command(_ op: String, _ fields: [String: Any] = [:], write: Bool = false, durable: Bool = false, commandID: String = UUID().uuidString.lowercased()) async throws -> [String: Any] {
+        let isPrompt = op == "prompt.send" || op == "prompt.steer"
+        let id = commandID
         var message = fields
         message["cmd_id"] = id
         message["op"] = op
@@ -365,24 +383,24 @@ final class ACPClient {
             guard !epoch.isEmpty, let cache else { throw ACPFailure(message: "请先配对服务器") }
             if broker == nil && op != "prompt.send" { throw URLError(.notConnectedToInternet) }
             try cache.queue(id: id, epoch: epoch, payload: payload)
-            if op == "prompt.send" { try restoreQueue() }
+            if isPrompt { try restoreQueue() }
         }
         guard let broker else {
-            if durable && op == "prompt.send" { return ["queued": true] }
+            if durable && isPrompt { return ["queued": true] }
             throw URLError(.notConnectedToInternet)
         }
         activeCommands.insert(id)
         defer { activeCommands.remove(id) }
         let reply: [String: Any]
         do {
-            reply = try await broker.request(id: id, payload: payload, timeout: op == "prompt.send" ? .seconds(86400) : .seconds(60))
+            reply = try await broker.request(id: id, payload: payload, timeout: isPrompt ? .seconds(86400) : .seconds(60))
         } catch {
-            if durable && op == "prompt.send" { return ["queued": true] }
+            if durable && isPrompt { return ["queued": true] }
             throw error
         }
         if durable {
             try cache?.complete(id: id, reply: reply)
-            if op == "prompt.send" { try restoreQueue() }
+            if isPrompt { try restoreQueue() }
         }
         return try checked(reply)
     }
@@ -394,7 +412,7 @@ final class ACPClient {
         for item in try replica?.pending(epoch: epoch) ?? [] {
             guard !observedCommands.contains(item.id),
                   let message = try JSONSerialization.jsonObject(with: item.payload) as? [String: Any],
-                  message["op"] as? String == "prompt.send", let thread = message["thread_id"] as? String,
+                  let op = message["op"] as? String, ["prompt.send", "prompt.steer"].contains(op), let thread = message["thread_id"] as? String,
                   let blocks = message["prompt"] as? [[String: Any]] else { continue }
             let text = blocks.compactMap { $0["text"] as? String }.joined()
             queued[thread, default: []].append(.init(id: item.id, text: text.isEmpty ? "附件" : text))
@@ -409,8 +427,9 @@ final class ACPClient {
             guard let msg = try? JSONSerialization.jsonObject(with: item.payload) as? [String: Any] else { continue }
             activeCommands.insert(item.id)
             let scope = msg["thread_id"] as? String ?? item.id
-            let previous = chains[scope]
-            chains[scope] = Task { [weak self] in
+            let isSteer = msg["op"] as? String == "prompt.steer"
+            let previous = isSteer ? nil : chains[scope]
+            let task = Task { [weak self] in
                 defer { self?.activeCommands.remove(item.id) }
                 await previous?.value
                 guard let self, self.broker === broker else { return }
@@ -423,6 +442,7 @@ final class ACPClient {
                     if self.broker === broker { self.notice(error.localizedDescription, in: scope) }
                 }
             }
+            if !isSteer { chains[scope] = task }
         }
     }
 
@@ -598,6 +618,7 @@ final class ACPClient {
             transcriptIndexes[id] = nil
             timelines[id]?.replace([])
             turns[id] = nil
+            steerableTurns[id] = nil
             confirmedThreads.remove(id)
             recordedPermissions.removeAll { $0.sessionID == id }
             sessionOptions[id] = nil
@@ -635,19 +656,50 @@ final class ACPClient {
                 if let mode = data["currentModeId"] as? String { sessionOptions[id, default: .init()].currentModeID = mode }
             case "turn.started":
                 if data["device_id"] as? String == deviceID, let cmd = data["cmd_id"] as? String {
+                    if steering[id] == cmd { steering[id] = nil }
                     observedCommands.insert(cmd)
                     queuedPrompts[id]?.removeAll { $0.id == cmd }
                 }
                 turns[id] = data["turn_id"] as? String
+                steerableTurns[id] = data["can_steer"] as? Bool == true ? turns[id] : nil
             case "message.user":
+                if data["device_id"] as? String == deviceID, let cmd = data["cmd_id"] as? String {
+                    if steering[id] == cmd { steering[id] = nil }
+                    observedCommands.insert(cmd)
+                    queuedPrompts[id]?.removeAll { $0.id == cmd }
+                }
                 let blocks = data["prompt"] as? [[String: Any]] ?? []
                 let entry = ACPEntry(kind: .user, text: blocks.compactMap { $0["text"] as? String }.joined(),
                                      attachments: blocks.compactMap(ACPAttachment.replayPreview))
                 updateTranscript(id) { history, _ in history.append(entry); return history.count - 1 }
             case "acp.history", "acp.update":
                 let notification = data["notification"] as? [String: Any] ?? data
-                if let update = notification["update"] as? [String: Any],
-                   event.kind == "acp.history" || update["sessionUpdate"] as? String != "user_message_chunk" { apply(update, to: id) }
+                guard let update = notification["update"] as? [String: Any] else { continue }
+                let kind = update["sessionUpdate"] as? String
+                if notification["protocolVersion"] as? Int == 2,
+                   let session = notification["sessionId"] as? String,
+                   let root = notification["rootSessionId"] as? String {
+                    if kind == "subagent_update", let child = update["sessionId"] as? String {
+                        applyChild(update, child: child, to: id)
+                        continue
+                    }
+                    if session != root {
+                        applyChild(update, child: session, to: id)
+                        continue
+                    }
+                    if kind == "session_message" || kind == "session_message_chunk" {
+                        let sender = update["senderSessionId"] as? String
+                        if let child = sender == root ? update["recipientSessionId"] as? String : sender {
+                            applyChild(update, child: child, to: id)
+                        }
+                        continue
+                    }
+                }
+                if event.kind == "acp.history" || (kind != "user_message" && kind != "user_message_chunk") {
+                    apply(update, to: id)
+                }
+            case "prompt.steer.failed":
+                notice("追加失败：" + (data["message"] as? String ?? "Agent 未能处理补充消息"), in: id)
             case "permission.requested":
                 guard let permission = data["permission_id"] as? String, let request = data["request"] as? [String: Any] else { continue }
                 let tool = request["toolCall"] as? [String: Any]
@@ -674,6 +726,7 @@ final class ACPClient {
                 }
                 if turns[id] == data["turn_id"] as? String {
                     turns[id] = nil
+                    steerableTurns[id] = nil
                     recordedPermissions.removeAll { $0.sessionID == id }
                 }
                 if let status = data["status"] as? String, status != "finished" { notice(status, in: id) }
@@ -893,13 +946,33 @@ final class ACPClient {
             options.modes = modes
             options.currentModeID = modes.currentModeId
         }
+        if let meta = result["_meta"] as? [String: Any], let commands = meta["johnnybotAvailableCommands"] as? [[String: Any]] {
+            options.commands = commands.compactMap { decodeACP(ACPCommand.self, from: $0) }
+        }
         sessionOptions[id] = options
     }
-    func prompt(_ text: String, attachments: [ACPAttachment] = [], in id: String) async throws {
-        guard loaded.contains(id), !prompting.contains(id), !submitting.contains(id) else { throw ACPFailure(message: "会话尚未就绪") }
+    func prompt(_ text: String, attachments: [ACPAttachment] = [], in id: String, steeringTurn: String? = nil) async throws {
+        guard loaded.contains(id), steeringTurn != nil || (canSubmit(in: id) && !prompting.contains(id)) else { throw ACPFailure(message: "会话尚未就绪") }
         var blocks: [[String: Any]] = text.isEmpty ? [] : [["type": "text", "text": text]]
         blocks += attachments.map(\.promptBlock)
         guard (1...32).contains(blocks.count) else { throw ACPFailure(message: "每条消息支持 1 至 32 项内容") }
+        if let turn = steeringTurn {
+            guard connected, steering[id] == nil else { throw ACPFailure(message: "暂时无法追加消息") }
+            let cmd = UUID().uuidString.lowercased()
+            steering[id] = cmd
+            defer { if steering[id] == cmd { steering[id] = nil } }
+            do {
+                _ = try await command("prompt.steer", ["thread_id": id, "turn_id": turn, "prompt": blocks], write: true, durable: true, commandID: cmd)
+            } catch let error as ACPFailure where error.reason == "not_active" {
+                try await sync("thread/" + id)
+                guard turns[id] == nil else { throw error }
+                let next = UUID().uuidString.lowercased()
+                steering[id] = next
+                defer { if steering[id] == next { steering[id] = nil } }
+                _ = try await command("prompt.send", ["thread_id": id, "prompt": blocks], write: true, durable: true, commandID: next)
+            }
+            return
+        }
         submitting.insert(id)
         if connected { sendStarted[id] = .now }
         defer { submitting.remove(id) }
@@ -930,11 +1003,55 @@ final class ACPClient {
         }
     }
 
+    private func applyChild(_ update: [String: Any], child: String, to id: String) {
+        guard let kind = update["sessionUpdate"] as? String else { return }
+        let key = "johnnybot/subagent/" + child
+        updateTranscript(id) { history, index in
+            let offset = index.tools[key] ?? history.count
+            if offset == history.count {
+                index.tools[key] = offset
+                history.append(ACPEntry(kind: .tool, text: "子 Agent", toolID: key, toolStatus: "pending"))
+            }
+            let state = kind == "subagent_update" ? update["state"] as? [String: Any] : update
+            switch state?["state"] as? String {
+            case "idle": history[offset].toolStatus = state?["stopReason"] as? String == "error" ? "failed" : "completed"
+            case "running", "requires_action": history[offset].toolStatus = "in_progress"
+            default: break
+            }
+            if kind == "subagent_update", let title = update["title"] as? String { history[offset].text = title }
+            let item: String
+            var text: String
+            if kind == "subagent_update", let description = update["description"] as? String {
+                item = "description"
+                text = description
+            } else if let tool = update["toolCallId"] as? String, let title = update["title"] as? String {
+                item = "tool/" + tool
+                text = title
+            } else if let message = update["messageId"] as? String, let content = update["content"] {
+                item = "message/" + message
+                let blocks = content as? [[String: Any]] ?? [content as? [String: Any] ?? [:]]
+                text = blocks.compactMap { $0["text"] as? String }.joined()
+            } else { return offset }
+            if let previous = history[offset].childContentIndexes[item] {
+                if kind.hasSuffix("_chunk"), case let .text(old) = history[offset].toolContent[previous] {
+                    text = old + text
+                }
+                history[offset].toolContent[previous] = .text(text)
+            } else {
+                history[offset].childContentIndexes[item] = history[offset].toolContent.count
+                history[offset].toolContent.append(.text(text))
+            }
+            return offset
+        }
+    }
+
     private func apply(_ update: [String: Any], to id: String) {
         let kind = update["sessionUpdate"] as? String
         switch kind {
-        case "agent_message_chunk", "user_message_chunk", "agent_thought_chunk":
-            guard let content = update["content"] as? [String: Any] else { return }
+        case "agent_message_chunk", "user_message_chunk", "agent_thought_chunk", "agent_message", "user_message", "agent_thought":
+            guard let raw = update["content"] else { return }
+            let snapshot = kind?.hasSuffix("_chunk") == false
+            let blocks = raw as? [[String: Any]] ?? (raw as? [String: Any]).map { [$0] } ?? []
             let messageID = update["messageId"] as? String
             let meta = update["_meta"] as? [String: Any]
             let jetBrains = meta?["jetbrains"] as? [String: Any]
@@ -942,12 +1059,16 @@ final class ACPClient {
             let phase = (air?["phase"] as? String).flatMap(ACPEntry.MessagePhase.init(rawValue:))
             let entryKind: ACPEntry.Kind
             switch kind {
-            case "user_message_chunk": entryKind = .user
-            case "agent_thought_chunk": entryKind = .thought
+            case "user_message_chunk", "user_message": entryKind = .user
+            case "agent_thought_chunk", "agent_thought": entryKind = .thought
             default: entryKind = .agent
             }
-            let attachment = entryKind == .user ? ACPAttachment.replayPreview(content) : nil
-            let text = attachment == nil ? content["text"] as? String ?? "[\(content["type"] as? String ?? "内容")]" : ""
+            let attachments = entryKind == .user ? blocks.compactMap(ACPAttachment.replayPreview) : []
+            let text = blocks.compactMap { content -> String? in
+                if let text = content["text"] as? String { return text }
+                if entryKind == .user, ACPAttachment.replayPreview(content) != nil { return nil }
+                return "[\(content["type"] as? String ?? "内容")]"
+            }.joined()
             updateTranscript(id) { history, index in
                 let key = messageID.map { TranscriptIndex.Message(kind: entryKind, id: $0) }
                 let previousIndex: Int?
@@ -959,14 +1080,19 @@ final class ACPClient {
                     previousIndex = key.flatMap { index.messages[$0] }
                 }
                 if let previousIndex {
-                    history[previousIndex].text += text
-                    if let attachment { history[previousIndex].attachments.append(attachment) }
+                    if snapshot {
+                        history[previousIndex].text = text
+                        history[previousIndex].attachments = attachments
+                    } else {
+                        history[previousIndex].text += text
+                        history[previousIndex].attachments += attachments
+                    }
                     if let phase { history[previousIndex].phase = phase }
                     return previousIndex
                 } else {
                     if let key { index.messages[key] = history.count }
                     history.append(ACPEntry(kind: entryKind, text: text, messageID: messageID, phase: phase,
-                                            attachments: attachment.map { [$0] } ?? []))
+                                            attachments: attachments))
                     return history.count - 1
                 }
             }
