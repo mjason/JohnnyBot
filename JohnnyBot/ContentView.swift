@@ -786,6 +786,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                     }
                 }
             }
+            .modifier(ProjectLinkPreview(client: client, session: workspace.selection))
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 #if !os(iOS)
             .overlay(alignment: .bottomTrailing) {
@@ -1380,7 +1381,6 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 .contentShape(Rectangle())
                 .gesture(DismissKeyboardOnOutsideTap())
 #endif
-                .modifier(ProjectLinkPreview(client: client, session: id))
                 .id(id)
 
                 if let queue = client.queuedPrompts[id], !queue.isEmpty {

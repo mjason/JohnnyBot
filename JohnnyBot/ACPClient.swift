@@ -608,13 +608,16 @@ final class ACPClient {
         return .init(path: project.id, parent: project.relativePath == "." ? nil : String(project.id.split(separator: "/").dropLast().joined(separator: "/")), directories: dirs)
     }
 
-    func readProjectFile(_ path: String, session: String) async throws -> String {
+    func readProjectFile(_ path: String, session: String?, workspace: String?) async throws -> String {
         for attempt in 0...1 {
             var bytes = Data()
             var version = ""
             do {
                 while true {
-                    let page = try await command("file.read", ["thread_id": session, "path": path, "offset": bytes.count, "version": version])
+                    var arguments: [String: Any] = ["path": path, "offset": bytes.count, "version": version]
+                    if let session { arguments["thread_id"] = session }
+                    if let workspace { arguments["workspace_id"] = workspace }
+                    let page = try await command("file.read", arguments)
                     guard let encoded = page["bytes"] as? String, let part = Data(base64Encoded: encoded),
                           let v = page["version"] as? String, version.isEmpty || version == v,
                           page["next_offset"] as? Int == bytes.count + part.count else { throw ACPFailure(message: "文件分块无效") }

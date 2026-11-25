@@ -4,6 +4,7 @@
 //
 
 import Foundation
+import SwiftUI
 import HighlightSwift
 
 actor HighlightTaskManager: ObservableObject {
@@ -18,6 +19,11 @@ actor HighlightTaskManager: ObservableObject {
   /// When multiple CodeBlockViews render concurrently, N separate JSContexts cause
   /// JavaScriptCore OOM crashes (COPILOT-IOS-3F9C, 3F7Z, 3FSQ).
   private static let sharedHighlight = Highlight()
+
+  static func highlight(_ code: String, language: String, colors: HighlightColors) async throws -> AttributedString {
+    let result = try await sharedHighlight.request(code, mode: .languageAliasIgnoreIllegal(language), colors: colors)
+    return result.attributedText
+  }
 
   private var pending: Request?
   private var isProcessing = false
@@ -47,4 +53,9 @@ actor HighlightTaskManager: ObservableObject {
       }
     }
   }
+}
+
+/// Highlights source on a light or dark editor background.
+public func highlightSource(_ code: String, language: String, colorScheme: ColorScheme) async throws -> AttributedString {
+  try await HighlightTaskManager.highlight(code, language: language, colors: CodeBlockConfig.Theme.xcode.highlightColors(for: colorScheme))
 }
