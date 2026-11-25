@@ -18,3 +18,4 @@ Keep exactly one JohnnyBot test app running after launching a build. Check for e
 - Swift 客户端使用 MQTT 5、TLS 1.3 证书指纹和每设备 Ed25519 身份。Go 源码位于 `ssh mj@192.168.2.70` 的 `/home/mj/dev/go/johnny_bot`，接口字段以该仓库的 `INTEGRATION.md` 和实际服务为准。
 - 当前内网端点为 `mqtts://192.168.2.70:8883/spark-e9e8`。工作区 ID 与工作区内的相对路径分别传输。列表、会话、权限和模型状态以已提交的同步事件为准。
 - 使用独立的数据库、临时设备密钥和临时工作区测试断线重放、PTY 和永久删除。Mac 与 iPhone 测试可以注入临时身份，避免触发开发机钥匙串授权。
+- 服务器的设备名单由 systemd 用户服务通过 `~/.config/johnnybot/service.env` 中的 `JOHNNYBOT_CONFIG` 指向 `~/.config/johnnybot/devices.json`。编辑 JSON 的 `authorized_keys` 数组即可热更新设备公钥。首次配对可只填 MQTT 地址，核对客户端读取的服务器证书指纹后确认信任。

@@ -77,13 +77,58 @@ final class GoBroker {
     private var heartbeat: Task<Void, Never>?
     private var lastPacket = ContinuousClock.now
 
-    init(address: String, fingerprint: String, identity: DeviceIdentity) throws {
+    private static func endpoint(_ address: String) throws -> (host: String, port: NWEndpoint.Port, path: String) {
         guard let url = URLComponents(string: address), url.scheme == "mqtts", let host = url.host,
               let port = UInt16(exactly: url.port ?? 8883).flatMap(NWEndpoint.Port.init(rawValue:)),
               url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
               url.path.range(of: #"^/[A-Za-z0-9_-]{1,80}$"#, options: .regularExpression) != nil else {
             throw ACPFailure(message: "地址格式应为 mqtts://主机:8883/服务标识")
         }
+        return (host, port, url.path)
+    }
+
+    /// Read the peer certificate without sending MQTT credentials or accepting the connection.
+    static func presentedFingerprint(address: String) async throws -> String {
+        let endpoint = try endpoint(address)
+        let tls = NWProtocolTLS.Options()
+        sec_protocol_options_set_min_tls_protocol_version(tls.securityProtocolOptions, .TLSv13)
+        var probe: NWConnection?
+        var waiter: CheckedContinuation<String, Error>?
+        func finish(_ result: Result<String, Error>) {
+            guard let pending = waiter else { return }
+            waiter = nil
+            probe?.cancel()
+            probe = nil
+            pending.resume(with: result)
+        }
+        sec_protocol_options_set_verify_block(tls.securityProtocolOptions, { _, trust, complete in
+            let chain = SecTrustCopyCertificateChain(sec_trust_copy_ref(trust).takeRetainedValue()) as? [SecCertificate]
+            complete(false)
+            MainActor.assumeIsolated {
+                if let cert = chain?.first {
+                    finish(.success(SHA256.hash(data: SecCertificateCopyData(cert) as Data).hexString))
+                } else { finish(.failure(URLError(.serverCertificateUntrusted))) }
+            }
+        }, .main)
+        let connection = NWConnection(host: .init(endpoint.host), port: endpoint.port,
+                                      using: NWParameters(tls: tls, tcp: NWProtocolTCP.Options()))
+        probe = connection
+        let timeout = Task {
+            try await Task.sleep(for: .seconds(10))
+            finish(.failure(URLError(.timedOut)))
+        }
+        defer { timeout.cancel() }
+        return try await withCheckedThrowingContinuation { continuation in
+            waiter = continuation
+            connection.stateUpdateHandler = { state in
+                if case let .failed(error) = state { MainActor.assumeIsolated { finish(.failure(error)) } }
+            }
+            connection.start(queue: .main)
+        }
+    }
+
+    init(address: String, fingerprint: String, identity: DeviceIdentity) throws {
+        let (host, port, path) = try Self.endpoint(address)
         let pin = fingerprint.lowercased().replacingOccurrences(of: ":", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard pin.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil else {
             throw ACPFailure(message: "请填写服务器的 SHA-256 证书指纹")
@@ -91,7 +136,7 @@ final class GoBroker {
         self.pin = pin
         self.identity = identity
         deviceID = identity.id
-        prefix = "jb/v1" + url.path + "/"
+        prefix = "jb/v1" + path + "/"
         let tls = NWProtocolTLS.Options()
         sec_protocol_options_set_min_tls_protocol_version(tls.securityProtocolOptions, .TLSv13)
         sec_protocol_options_set_verify_block(tls.securityProtocolOptions, { _, trust, complete in

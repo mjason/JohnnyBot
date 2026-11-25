@@ -360,6 +360,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
     @ViewBuilder let header: () -> Header
     @ViewBuilder let trailingAction: () -> TrailingAction
     @State private var publicKey = ""
+    @State private var pendingTrust: (address: String, fingerprint: String)?
     @State private var choosingProject = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var scenePhase
@@ -525,6 +526,16 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 if scenePhase == .active { reconnectIfNeeded() }
             }
             openSelectedSession()
+        }
+        .alert("信任这台服务器？", isPresented: Binding(get: { pendingTrust != nil }, set: { if !$0 { pendingTrust = nil } }), presenting: pendingTrust) { server in
+            Button("信任并连接") {
+                guard client.address == server.address else { return }
+                client.fingerprint = server.fingerprint
+                connect(automatic: false)
+            }
+            Button("取消", role: .cancel) {}
+        } message: { server in
+            Text("\(server.address)\n\nSHA-256\n\(server.fingerprint)\n\n请与服务器提供的指纹核对。")
         }
         .alert("操作失败", isPresented: Binding(get: { workspace.failure != nil }, set: { if !$0 { workspace.failure = nil } })) {
             Button("确定") { workspace.failure = nil }
@@ -1074,8 +1085,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         @Bindable var client = client
 #if os(iOS)
         let canConnect = !workspace.managing &&
-            !client.address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-            !client.fingerprint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            !client.address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         return Form {
             Section {
                 TextField("mqtts://主机:8883/服务标识", text: serverAddress)
@@ -1087,15 +1097,15 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
             } header: { Text("服务器地址") } footer: {
                 Text("末尾的服务标识取自 Go 服务的 -host 参数。")
             }
-            Section("证书指纹") {
-                TextField("SHA-256 指纹", text: $client.fingerprint)
+            Section("设备配对") {
+                TextField("SHA-256 指纹（可选）", text: $client.fingerprint)
                     .focused($connectionFocus, equals: .fingerprint)
                     .submitLabel(.go)
                     .onSubmit {
                         if canConnect { connectionFocus = nil; connect(automatic: false) }
                     }
                 pairButton
-                Text("将公钥添加到服务器的 authorized_keys 后即可连接。").font(.footnote).foregroundStyle(.secondary)
+                Text("服务器配置中需包含本设备公钥。首次连接会显示证书指纹供核对。").font(.footnote).foregroundStyle(.secondary)
             }
             Section {
                 Button {
@@ -1120,36 +1130,40 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         .gesture(DismissKeyboardOnOutsideTap())
 #else
         return ScrollView {
-            VStack(spacing: 24) {
-                VStack(spacing: 11) {
-                    Image(systemName: "bubble.left.and.bubble.right.fill")
-                        .font(.system(size: 32, weight: .medium))
-                        .symbolRenderingMode(.hierarchical)
-                        .foregroundStyle(Color.accentColor)
-                        .frame(width: 76, height: 76)
-                        .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 24))
-                        .accessibilityHidden(true)
-                    Text("连接 Agent").font(.largeTitle.bold())
-                    Text("填写 Go 服务地址和 TLS 证书指纹，并将本设备公钥添加到服务器的 authorized_keys。")
+            VStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("连接服务器").font(.title.bold())
+                        .accessibilityAddTraits(.isHeader)
+                    Text("首次连接时，请核对服务器的证书指纹。")
                         .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                VStack(alignment: .leading, spacing: 12) {
-                    connectionField("服务器地址", icon: "server.rack") {
-                        TextField("mqtts://主机:8883/服务标识", text: serverAddress)
+                VStack(alignment: .leading, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("服务器地址").font(.headline)
+                        TextField("mqtts://host:8883/server-id", text: serverAddress)
                             .accessibilityLabel("服务器地址")
                     }
-                    connectionField("证书指纹", icon: "key") {
+                    DisclosureGroup("手动设置证书指纹") {
                         TextField("SHA-256 指纹", text: $client.fingerprint)
                             .accessibilityLabel("证书指纹")
+                            .padding(.top, 4)
                     }
+                    .font(.callout)
                 }
                 .textFieldStyle(.roundedBorder)
                 .disabled(workspace.managing)
                 .autocorrectionDisabled()
                 ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 12) { connectionButtons }
-                    VStack(spacing: 12) { connectionButtons }
+                    HStack(spacing: 12) {
+                        pairButton
+                        Spacer(minLength: 8)
+                        connectButton
+                    }
+                    VStack(alignment: .leading, spacing: 8) {
+                        pairButton
+                        connectButton
+                    }
                 }
                 .controlSize(.large)
                 .disabled(workspace.managing)
@@ -1164,19 +1178,6 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         }
         .navigationTitle("JohnnyBot")
 #endif
-    }
-
-    private func connectionField<Field: View>(_ title: String, icon: String, @ViewBuilder field: () -> Field) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: icon)
-                .foregroundStyle(.secondary)
-                .frame(width: 18)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title).font(.caption.weight(.medium)).foregroundStyle(.secondary)
-                field()
-            }
-        }
     }
 
     private var pairButton: some View {
@@ -1196,17 +1197,15 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
         .help("复制 OpenSSH 公钥")
     }
 
-    @ViewBuilder private var connectionButtons: some View {
-        pairButton
+    private var connectButton: some View {
         Button {
             connect(automatic: false)
         } label: {
-            Label("连接", systemImage: "arrow.right")
+            Text("连接")
         }
         .buttonStyle(.borderedProminent)
         .buttonBorderShape(.capsule)
-        .disabled(client.address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                  client.fingerprint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        .disabled(client.address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 
     private func reconnectIfNeeded() {
@@ -1222,6 +1221,17 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
     private func connect(automatic: Bool) {
         manage {
             client.address = client.address.trimmingCharacters(in: .whitespacesAndNewlines)
+            if client.fingerprint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let address = client.address
+                if let saved = UserDefaults.standard.string(forKey: "goPin." + address), !saved.isEmpty {
+                    client.fingerprint = saved
+                } else {
+                    guard !automatic else { return }
+                    let pin = try await GoBroker.presentedFingerprint(address: address)
+                    if client.address == address { pendingTrust = (address, pin) }
+                    return
+                }
+            }
             do { try await client.connect() }
             catch { if automatic && client.offline { return }; throw error }
             UserDefaults.standard.removeObject(forKey: "acpManuallyDisconnected." + client.address)

@@ -18,7 +18,6 @@ enum RowContent: Equatable {
 
 struct TableView: View {
   @Environment(\.markdownConfig) var config: MarkdownRenderConfig
-  @Environment(\.markdownController) var controller: MarkdownController?
 
   let headings: [AttributedString]
   let rows: [[RowContent]]
@@ -26,13 +25,8 @@ struct TableView: View {
 
   private let defaultMaxColumnWidth: CGFloat = 200
   @State private var scrollWidth: CGFloat = 0
-  @State private var isExpanded: Bool = false
-  @State private var isCopyPressed: Bool = false
-  @State private var isCopyScaled: Bool = false
 
-  private let rawMarkdown: String
-
-  init(headings: [NSMutableAttributedString], rows: [[NSMutableAttributedString]], columnMaxWidths: [Int: CGFloat] = [:], rawMarkdown: String = "") {
+  init(headings: [NSMutableAttributedString], rows: [[NSMutableAttributedString]], columnMaxWidths: [Int: CGFloat] = [:]) {
     self.headings = headings.map { AttributedString($0) }
     self.rows = rows.map { row in
       row.map { content in
@@ -45,7 +39,6 @@ struct TableView: View {
     }
 
     self.columnMaxWidths = columnMaxWidths
-    self.rawMarkdown = rawMarkdown
   }
 
   private var numOfRows: Int {
@@ -135,30 +128,6 @@ struct TableView: View {
   }
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 0) {
-      if controller != nil {
-        scrollView.onTapGesture {
-          withAnimation(.easeInOut(duration: 0.2)) {
-            isExpanded.toggle()
-          }
-        }
-      } else {
-        scrollView
-      }
-
-      if isExpanded {
-        HStack(spacing: 0) {
-          tableCopyButton
-          tableDownloadButton
-        }
-        .padding(.top, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .transition(.opacity)
-      }
-    }
-  }
-
-  var scrollView: some View {
     ScrollView([.horizontal]) {
       gridView
     }
@@ -173,54 +142,6 @@ struct TableView: View {
       scrollWidth = newWidth
     }
     .scrollIndicators(.hidden)
-    .contentShape(Rectangle())
-  }
-
-  private var tableCopyButton: some View {
-    Button(action: {
-      controller?.onTableCopyTap(content: rawMarkdown)
-      isCopyPressed = true
-      withAnimation(.easeInOut(duration: 0.2)) {
-        isCopyScaled = true
-      }
-      Task { @MainActor in
-        try? await Task.sleep(nanoseconds: 200_000_000)
-        withAnimation(.easeInOut(duration: 0.25)) {
-          isCopyPressed = false
-          isCopyScaled = false
-        }
-      }
-    }, label: {
-      ZStack {
-        Image("Copy", bundle: .module)
-          .renderingMode(.template)
-          .foregroundStyle(config.tableStyle.actionButtonColor)
-          .frame(width: 20, height: 20)
-          .opacity(isCopyPressed ? 0.0 : 1.0)
-
-        Image("CopyFilled", bundle: .module)
-          .renderingMode(.template)
-          .foregroundStyle(config.tableStyle.actionButtonColor)
-          .frame(width: 20, height: 20)
-          .opacity(isCopyPressed ? 1.0 : 0.0)
-      }
-      .scaleEffect(isCopyScaled ? 1.3 : 1.0)
-    })
-    .frame(width: 32, height: 32)
-    .contentShape(Rectangle())
-  }
-
-  private var tableDownloadButton: some View {
-    Button(action: {
-      controller?.onTableDownloadTap(content: rawMarkdown)
-    }, label: {
-      Image("downloadArrow", bundle: .module)
-        .renderingMode(.template)
-        .foregroundStyle(config.tableStyle.actionButtonColor)
-        .frame(width: 20, height: 20)
-        .padding(2)
-    })
-    .frame(width: 32, height: 32)
     .contentShape(Rectangle())
   }
 }
