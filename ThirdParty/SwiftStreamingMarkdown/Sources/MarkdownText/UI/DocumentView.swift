@@ -13,6 +13,7 @@ import SwiftUI
 /// pipeline); use `MarkdownView` when you want the package to parse for you.
 @Equatable
 public struct DocumentView: View {
+  @Environment(\.markdownSelectionEditor) private var selectionEditor
   @StateObject var controller: MarkdownController
 
   let renderableDocument: RenderableDocument
@@ -36,7 +37,7 @@ public struct DocumentView: View {
   public var body: some View {
     VStack(alignment: .leading, spacing: 6) {
       BlockView(renderables: renderableDocument.renderables)
-      if config.textSelectionConfig.isEnabled, renderableDocument.renderables.count > 1 || renderableDocument.hasStructuredSelection {
+      if selectionEditor == nil, config.textSelectionConfig.isEnabled, renderableDocument.renderables.count > 1 || renderableDocument.hasStructuredSelection {
         Button {
           controller.isTextSelectionRequested = true
         } label: {
@@ -61,17 +62,23 @@ public struct DocumentView: View {
       }
     }
     .sheet(isPresented: $controller.isTextSelectionRequested) {
-      TextSelectionView(
-        text: renderableDocument.plainText,
-        backgroundColor: config.textSelectionConfig.backgroundColor ?? Color.Theme.Background.Page.Chat.Flat
-      ) {
-        controller.isTextSelectionRequested = false
+      if let selectionEditor {
+        selectionEditor(renderableDocument.plainText)
+      } else {
+        TextSelectionView(
+          text: renderableDocument.plainText,
+          backgroundColor: config.textSelectionConfig.backgroundColor ?? Color.Theme.Background.Page.Chat.Flat
+        ) {
+          controller.isTextSelectionRequested = false
+        }
       }
     }
   }
 }
 
 extension EnvironmentValues {
+  /// Optional host editor presented by the document-wide text selection action.
+  @Entry public var markdownSelectionEditor: (@MainActor (String) -> AnyView)? = nil
   /// The render configuration applied to descendant Markdown views.
   @Entry public var markdownConfig: MarkdownRenderConfig = .default
   /// The shared controller used by descendant Markdown views to route

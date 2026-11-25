@@ -506,7 +506,8 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
             if let id, let project = projects.first(where: { client.directory.contains(id, in: $0) }) {
                 workspace.activeProject = project
                 if let session = client.directory.session(id: id) {
-                    let location = ["id": id, "project": project.id, "title": session.title, "cwd": session.cwd]
+                    var location = ["id": id, "project": project.id, "title": session.title, "cwd": session.cwd]
+                    location["agent"] = session.agent
                     UserDefaults.standard.set(location, forKey: "acpLastSession." + client.address)
                 }
             }
@@ -994,12 +995,12 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
 
     private func projectMenuItems(_ project: ACPProject) -> [SidebarMenuItem] {
         var items = client.agents.map { agent in
-            SidebarMenuItem("新建 " + agent + " 会话", "square.and.pencil", disabled: workspace.managing || !client.connected) {
+            SidebarMenuItem("新建 " + ACPSession.displayName(for: agent) + " 会话", ACPSession.symbol(for: agent), disabled: workspace.managing || !client.connected) {
                 createSession(in: project, agent: agent)
             }
         }
         for agent in client.agents where client.connected {
-            items.append(SidebarMenuItem("发现 " + agent + " 会话", "arrow.clockwise", disabled: workspace.managing) {
+            items.append(SidebarMenuItem("发现 " + ACPSession.displayName(for: agent) + " 会话", "arrow.clockwise", disabled: workspace.managing) {
                 manage { try await client.refreshSessions(in: project, agent: agent) }
             })
         }
@@ -1249,7 +1250,7 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
             if !client.directory.contains(id, in: lastProject) {
 #if os(iOS)
                 guard client.supportsSessionLoad else { return }
-                let saved = ACPSession(id: id, title: last["title"] ?? "上次会话", cwd: last["cwd"] ?? lastProject.path ?? "")
+                let saved = ACPSession(id: id, title: last["title"] ?? "上次会话", cwd: last["cwd"] ?? lastProject.path ?? "", agent: last["agent"])
                 try await client.restoreUnlistedSession(saved, in: lastProject)
                 guard client.connected, workspace.selection == initial else { return }
 #else
@@ -1675,11 +1676,12 @@ private struct SessionListRow: View {
         let active = client.loaded.contains(session.id)
         let approvalPending = client.permissions.contains { $0.sessionID == session.id }
         return HStack(spacing: 10) {
-            Image(systemName: active ? "bubble.left.fill" : "bubble.left")
+            Image(systemName: session.symbol(loaded: active))
                 .foregroundStyle(workspace.selection == session.id ? Color.primary : Color.accentColor)
                 .frame(width: 22)
                 .accessibilityHidden(true)
             Text(session.title).font(.body.weight(.medium)).lineLimit(1)
+                .accessibilityValue(session.agentName ?? "")
             Spacer(minLength: 0)
             if approvalPending {
                 Image(systemName: "lock.shield")

@@ -13,14 +13,14 @@ struct DeviceIdentity {
         return "ssh-ed25519 " + (field(algorithm) + field(key.publicKey.rawRepresentation)).base64EncodedString() + " JohnnyBot"
     }
 
-    func password(pin: String) throws -> String {
+    func password(pin: String, context: String = "johnnybot-mqtt-auth-v1") throws -> String {
         func url64(_ data: Data) -> String {
             data.base64EncodedString().replacingOccurrences(of: "+", with: "-")
                 .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
         }
         let seconds = String(Int(Date().timeIntervalSince1970))
         let nonce = url64(Data((0..<16).map { _ in UInt8.random(in: 0...255) }))
-        let message = ["johnnybot-mqtt-auth-v1", pin, id, seconds, nonce].joined(separator: "\n")
+        let message = [context, pin, id, seconds, nonce].joined(separator: "\n")
         return [seconds, nonce, url64(try key.signature(for: Data(message.utf8)))].joined(separator: ".")
     }
 }

@@ -5,16 +5,44 @@ final class ACPSession: Identifiable {
     let id: String
     var title: String
     var cwd: String
+    var agent: String?
 
-    init(id: String, title: String, cwd: String = "") {
+    var agentName: String? { agent.map(Self.displayName(for:)) }
+
+    static func displayName(for agent: String) -> String {
+        switch agent {
+        case "codex": "Codex"
+        case "antigravity": "Antigravity"
+        default: agent
+        }
+    }
+
+    func symbol(loaded: Bool) -> String {
+        Self.symbol(for: agent, loaded: loaded)
+    }
+
+    static func symbol(for agent: String?, loaded: Bool = false) -> String {
+        let base: String
+        switch agent {
+        case "codex": base = "c.circle"
+        case "antigravity": base = "a.circle"
+        case "pi": base = "p.circle"
+        default: base = "bubble.left"
+        }
+        return loaded ? base + ".fill" : base
+    }
+
+    init(id: String, title: String, cwd: String = "", agent: String? = nil) {
         self.id = id
         self.title = title
         self.cwd = cwd
+        self.agent = agent
     }
 
-    fileprivate func update(title: String, cwd: String) {
+    fileprivate func update(title: String, cwd: String, agent: String?) {
         if self.title != title { self.title = title }
         if self.cwd != cwd { self.cwd = cwd }
+        if let agent, self.agent != agent { self.agent = agent }
     }
 }
 
@@ -22,6 +50,7 @@ struct ListedSession {
     let id: String
     var title: String
     let cwd: String
+    var agent: String? = nil
 }
 
 @MainActor @Observable
@@ -51,10 +80,10 @@ final class SessionDirectory {
 
     private func update(_ item: ListedSession) -> ACPSession {
         if let row = byID[item.id] {
-            row.update(title: item.title, cwd: item.cwd)
+            row.update(title: item.title, cwd: item.cwd, agent: item.agent)
             return row
         }
-        let row = ACPSession(id: item.id, title: item.title, cwd: item.cwd)
+        let row = ACPSession(id: item.id, title: item.title, cwd: item.cwd, agent: item.agent)
         byID[item.id] = row
         return row
     }
@@ -70,7 +99,7 @@ final class SessionDirectory {
            zip(list.rows, items).allSatisfy({ $0.id == $1.id }),
            list.rows.dropFirst(items.count).allSatisfy({ loaded.contains($0.id) }) {
             for (row, item) in zip(list.rows, items) {
-                row.update(title: item.title, cwd: item.cwd)
+                row.update(title: item.title, cwd: item.cwd, agent: item.agent)
             }
         } else {
             let local = loaded.isEmpty ? [] : list.rows.filter { loaded.contains($0.id) && !ids.contains($0.id) }
@@ -89,7 +118,7 @@ final class SessionDirectory {
         let row: ACPSession
         if let existing = byID[session.id] {
             row = existing
-            if atFront { row.update(title: session.title, cwd: session.cwd) }
+            if atFront { row.update(title: session.title, cwd: session.cwd, agent: session.agent) }
         } else {
             byID[session.id] = session
             row = session

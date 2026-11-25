@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftStreamingMarkdown
+import CodeEditorView
 #if os(macOS)
 import AppKit
 #else
@@ -497,6 +498,30 @@ private struct TranscriptMarkdown: View {
     }
 }
 
+private struct TranscriptSelectionSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var position = CodeEditor.Position()
+    @State private var text: String
+
+    init(text: String) {
+        // Keep the selection stable while the original reply continues streaming.
+        _text = State(initialValue: text)
+    }
+
+    var body: some View {
+        NavigationStack {
+            ProjectCodeEditor(source: text, position: $position)
+                .navigationTitle("选择回复文本")
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } }
+                }
+        }
+#if os(macOS)
+        .frame(minWidth: 520, minHeight: 380)
+#endif
+    }
+}
+
 private struct TranscriptMarkdownDocument: View {
     let entryID: UUID
     let text: String
@@ -528,6 +553,7 @@ private struct TranscriptMarkdownDocument: View {
         VStack(alignment: .leading, spacing: 0) {
             if let document = parsed?.document ?? cached {
                 DocumentView(renderableDocument: document, config: config)
+                    .environment(\.markdownSelectionEditor) { AnyView(TranscriptSelectionSheet(text: $0)) }
             } else if !isStreaming {
                 Text(verbatim: text)
                     .font(.system(size: textSize))

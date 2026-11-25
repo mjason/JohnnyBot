@@ -34,6 +34,14 @@ struct SingleBlockView: View, Equatable {
 
   @Environment(\.markdownConfig) var config: MarkdownRenderConfig
 
+  @Environment(\.markdownController) private var controller
+
+  @ViewBuilder private var documentSelectionAction: some View {
+    if config.textSelectionConfig.isEnabled {
+      Button(String.selectMoreTextLabel) { controller?.requestTextSelection() }
+    }
+  }
+
   let renderable: MarkdownRenderable
 
   init(renderable: MarkdownRenderable) {
@@ -65,10 +73,12 @@ struct SingleBlockView: View, Equatable {
       case .codeBlock(_, let language, let code):
         CodeBlockView(language: language ?? "",
                       code: code)
+          .contextMenu { documentSelectionAction }
       case .thematicBreak:
         ThematicBreakView()
       case .table(_, let headers, let rows, _):
         TableView(headings: headers, rows: rows)
+          .contextMenu { documentSelectionAction }
       case .blockQuote(_, let item):
         BlockQuoteView(item: item)
       case .image(let id, let data):

@@ -19,3 +19,6 @@ Keep exactly one JohnnyBot test app running after launching a build. Check for e
 - 当前内网端点为 `mqtts://192.168.2.70:8883/spark-e9e8`。工作区 ID 与工作区内的相对路径分别传输。列表、会话、权限和模型状态以已提交的同步事件为准。
 - 使用独立的数据库、临时设备密钥和临时工作区测试断线重放、PTY 和永久删除。Mac 与 iPhone 测试可以注入临时身份，避免触发开发机钥匙串授权。
 - 服务器的设备名单由 systemd 用户服务通过 `~/.config/johnnybot/service.env` 中的 `JOHNNYBOT_CONFIG` 指向 `~/.config/johnnybot/devices.json`。编辑 JSON 的 `authorized_keys` 数组即可热更新设备公钥。首次配对可只填 MQTT 地址，核对客户端读取的服务器证书指纹后确认信任。
+
+- 每次重启生产 systemd 服务前，先说明影响并取得本次重启的明确确认，再检查活跃会话和终端。
+- 服务端启用 `-quic` 时，文件和数据库事件可通过同一端口的 UDP 读取，复用已配对的证书指纹和设备身份。终端和写操作继续使用 MQTT。验证同步时同时测试已提交游标续传和 MQTT 回退。

@@ -175,6 +175,13 @@ final class ACPClient {
     private(set) var permissions: [ACPPermission] = []
 
     @ObservationIgnored private var broker: GoBroker?
+    @ObservationIgnored private var reads: QuicReadClient?
+    private struct ScopeFollower {
+        let id: UUID
+        let task: Task<Void, Never>
+    }
+    @ObservationIgnored private var followers: [String: ScopeFollower] = [:]
+    @ObservationIgnored private var nextQuicAttempt = ContinuousClock.now
     @ObservationIgnored private var replica: GoReplica?
     @ObservationIgnored private var identity: DeviceIdentity?
     @ObservationIgnored private var replicaName = ""
@@ -258,6 +265,10 @@ final class ACPClient {
             workspaceIDs = ids
             agents = info["agents"] as? [String] ?? ["codex"]
             capabilities = info["capabilities"] as? [String: Bool] ?? [:]
+            if capabilities["quic_reads_v1"] == true {
+                reads = QuicReadClient(address: address, fingerprint: fingerprint, identity: device)
+                nextQuicAttempt = .now
+            }
             UserDefaults.standard.set(epoch, forKey: "goEpoch." + replicaName)
             UserDefaults.standard.set(ids, forKey: "goWorkspaces." + replicaName)
             connected = true
@@ -282,6 +293,10 @@ final class ACPClient {
         let old = broker
         broker = nil
         old?.close()
+        reads?.close()
+        reads = nil
+        for follower in followers.values { follower.task.cancel() }
+        followers.removeAll()
         poll?.cancel()
         poll = nil
         for task in pulling.values { task.cancel() }
@@ -397,7 +412,7 @@ final class ACPClient {
     }
 
     func catchUp() {
-        for scope in hydrated { hint(scope) }
+        for scope in hydrated where followers[scope] == nil { hint(scope) }
         resumeOutbox()
     }
 
@@ -405,6 +420,62 @@ final class ACPClient {
         guard connected, hydrated.contains(scope) else { return }
         if pulling[scope] != nil { dirty.insert(scope); return }
         Task { do { try await sync(scope) } catch { if connected { status = error.localizedDescription } } }
+    }
+
+    private func cursorFields(_ position: GoReplica.Cursor, scope: String) -> [String: Any] {
+        var fields: [String: Any] = ["scope": scope, "after": position.after, "limit": 100]
+        if !position.epoch.isEmpty { fields["epoch"] = position.epoch }
+        if position.through != 0 { fields["through"] = position.through }
+        return fields
+    }
+
+    private func streamPages(_ reads: QuicReadClient, cache: GoReplica, scope: String, follow: Bool,
+                             transport: GoBroker) async throws {
+        let fields = cursorFields(try cache.cursor(scope), scope: scope)
+        var complete = false
+        let workspace = scope.hasPrefix("threads/") ? String(scope.dropFirst(8)) : nil
+        var listNeedsRefresh = false
+        defer {
+            if listNeedsRefresh, let workspace, broker === transport { rebuildLists(workspace) }
+        }
+        try await reads.pages(fields, follow: follow) { page in
+            try Task.checkCancellation()
+            guard broker === transport, hydrated.contains(scope) else { throw CancellationError() }
+            guard page["reset"] as? Bool != true else { throw ACPFailure(message: "同步游标需要重置") }
+            let position = try cache.cursor(scope)
+            // An idle heartbeat already matches the committed cursor.
+            if position.epoch == epoch, page["epoch"] as? String == epoch, page["scope"] as? String == scope,
+               page["after"] as? Int64 == position.after, page["through"] as? Int64 == position.after,
+               page["more"] as? Bool == false, (page["events"] as? [Any])?.isEmpty == true {
+                complete = true
+                return
+            }
+            let events = try cache.apply(page, scope: scope, expected: position, epoch: epoch)
+            complete = page["more"] as? Bool == false
+            applyEvents(events, scope: scope, replay: false, refreshList: false)
+            if let workspace {
+                listNeedsRefresh = listNeedsRefresh || !events.isEmpty
+                if complete, listNeedsRefresh {
+                    rebuildLists(workspace)
+                    listNeedsRefresh = false
+                }
+            }
+        }
+        guard complete, !follow else { throw URLError(.networkConnectionLost) }
+    }
+
+    private func follow(_ scope: String, reads: QuicReadClient, cache: GoReplica, transport: GoBroker) {
+        let id = UUID()
+        let task = Task {
+            do { try await streamPages(reads, cache: cache, scope: scope, follow: true, transport: transport) }
+            catch {
+                guard !Task.isCancelled, followers[scope]?.id == id, broker === transport else { return }
+                followers.removeValue(forKey: scope)
+                nextQuicAttempt = .now.advanced(by: .seconds(30))
+                hint(scope)
+            }
+        }
+        followers[scope] = ScopeFollower(id: id, task: task)
     }
 
     private func sync(_ scope: String) async throws {
@@ -420,6 +491,26 @@ final class ACPClient {
         if let task = pulling[scope] { return try await task.value }
         let task = Task {
             defer { if broker === transport { pulling.removeValue(forKey: scope) } }
+            followers.removeValue(forKey: scope)?.task.cancel()
+            if let reads, ContinuousClock.now >= nextQuicAttempt {
+                do {
+                    try await streamPages(reads, cache: cache, scope: scope, follow: false, transport: transport)
+                    try Task.checkCancellation()
+                    guard broker === transport else { throw CancellationError() }
+                    if followers.count < 16 {
+                        if subscriptions.contains(scope) {
+                            try await transport.subscribe("ev/" + scope, enabled: false)
+                            subscriptions.remove(scope)
+                        }
+                        follow(scope, reads: reads, cache: cache, transport: transport)
+                        return
+                    }
+                } catch {
+                    try Task.checkCancellation()
+                    guard broker === transport else { throw CancellationError() }
+                    nextQuicAttempt = .now.advanced(by: .seconds(30))
+                }
+            }
             if !subscriptions.contains(scope) {
                 try await transport.subscribe("ev/" + scope)
                 subscriptions.insert(scope)
@@ -429,9 +520,7 @@ final class ACPClient {
                 while true {
                     try Task.checkCancellation()
                     let position = try cache.cursor(scope)
-                    var args: [String: Any] = ["scope": scope, "after": position.after, "limit": 100]
-                    if !position.epoch.isEmpty { args["epoch"] = position.epoch }
-                    if position.through != 0 { args["through"] = position.through }
+                    let args = cursorFields(position, scope: scope)
                     let page: [String: Any]
                     do { page = try await command("sync.pull", args) }
                     catch let error as ACPFailure where error.reason == "not_found" && scope.hasPrefix("thread/") {
@@ -479,14 +568,14 @@ final class ACPClient {
         }
     }
 
-    private func applyEvents(_ events: [GoReplica.Event], scope: String, replay: Bool) {
+    private func applyEvents(_ events: [GoReplica.Event], scope: String, replay: Bool, refreshList: Bool = true) {
         if scope.hasPrefix("threads/") {
             for event in events {
                 guard let id = event.data["thread_id"] as? String else { continue }
                 if event.kind == "thread.upsert" { threads[id] = event.data }
                 if event.kind == "thread.deleted" { purge(id) }
             }
-            if replay || !events.isEmpty { rebuildLists(String(scope.dropFirst(8))) }
+            if refreshList && (replay || !events.isEmpty) { rebuildLists(String(scope.dropFirst(8))) }
             return
         }
         let id = String(scope.dropFirst(7))
@@ -571,6 +660,7 @@ final class ACPClient {
         timings[id] = nil
         sendStarted[id] = nil
         let scope = "thread/" + id
+        followers.removeValue(forKey: scope)?.task.cancel()
         pulling[scope]?.cancel()
         hydrated.remove(scope)
         resetProjection(scope)
@@ -585,7 +675,7 @@ final class ACPClient {
                 guard let id = item["thread_id"] as? String, let path = item["path"] as? String,
                       project.relativePath == "." || project.relativePath == path else { return nil }
                 let title = item["title"] as? String ?? ""
-                return ListedSession(id: id, title: title.isEmpty ? "新会话" : title, cwd: path)
+                return ListedSession(id: id, title: title.isEmpty ? "新会话" : title, cwd: path, agent: item["agent"] as? String)
             }
             directory.replace(rows, ids: Set(rows.map(\.id)), in: project, retaining: [], complete: true)
         }
@@ -608,16 +698,30 @@ final class ACPClient {
         return .init(path: project.id, parent: project.relativePath == "." ? nil : String(project.id.split(separator: "/").dropLast().joined(separator: "/")), directories: dirs)
     }
 
-    func readProjectFile(_ path: String, session: String?, workspace: String?) async throws -> String {
+    func readProjectFile(_ path: String, session: String?, workspace: String?,
+                         firstPage: ((String) -> Void)? = nil) async throws -> String {
+        var location: [String: Any] = ["path": path]
+        if let session { location["thread_id"] = session }
+        if let workspace { location["workspace_id"] = workspace }
+        if let reads, ContinuousClock.now >= nextQuicAttempt {
+            do { return try await reads.file(location, firstPage: firstPage) }
+            catch {
+                try Task.checkCancellation()
+                guard self.reads === reads else { throw CancellationError() }
+                if !(error is ACPFailure) { nextQuicAttempt = .now.advanced(by: .seconds(30)) }
+            }
+        }
         for attempt in 0...1 {
             var bytes = Data()
             var version = ""
             do {
                 while true {
-                    var arguments: [String: Any] = ["path": path, "offset": bytes.count, "version": version]
+                    try Task.checkCancellation()
+                    var arguments: [String: Any] = ["path": path, "offset": bytes.count, "version": version, "limit": 168 * 1024]
                     if let session { arguments["thread_id"] = session }
                     if let workspace { arguments["workspace_id"] = workspace }
                     let page = try await command("file.read", arguments)
+                    try Task.checkCancellation()
                     guard let encoded = page["bytes"] as? String, let part = Data(base64Encoded: encoded),
                           let v = page["version"] as? String, version.isEmpty || version == v,
                           page["next_offset"] as? Int == bytes.count + part.count else { throw ACPFailure(message: "文件分块无效") }
@@ -672,6 +776,7 @@ final class ACPClient {
     func close(_ id: String) async throws {
         let scope = "thread/" + id
         loaded.remove(id)
+        followers.removeValue(forKey: scope)?.task.cancel()
         pulling[scope]?.cancel()
         hydrated.remove(scope)
         resetProjection(scope)

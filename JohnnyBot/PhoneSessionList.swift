@@ -166,7 +166,7 @@ struct PhoneSessionList: UIViewControllerRepresentable {
                     let client = model.client
                     cell.render = { cell in
                         let approval = client.permissions.contains { $0.sessionID == session.id }
-                        cell.configure(title: session.title, symbol: client.loaded.contains(session.id) ? "bubble.left.fill" : "bubble.left",
+                        cell.configure(title: session.title, symbol: session.symbol(loaded: client.loaded.contains(session.id)), agent: session.agentName,
                                        accessory: approval ? .permission : client.prompting.contains(session.id) ? .responding : .session)
                     }
                 }
@@ -213,6 +213,7 @@ struct PhoneSessionList: UIViewControllerRepresentable {
         private struct Appearance: Equatable {
             let title: String
             let symbol: String?
+            let agent: String?
             let accessory: Accessory
             let textSize: UIContentSizeCategory
         }
@@ -227,8 +228,8 @@ struct PhoneSessionList: UIViewControllerRepresentable {
             render?(self)
         }
 
-        func configure(title: String, symbol: String? = nil, accessory: Accessory) {
-            let appearance = Appearance(title: title, symbol: symbol, accessory: accessory,
+        func configure(title: String, symbol: String? = nil, agent: String? = nil, accessory: Accessory) {
+            let appearance = Appearance(title: title, symbol: symbol, agent: agent, accessory: accessory,
                                         textSize: traitCollection.preferredContentSizeCategory)
             // UIKit can schedule updateProperties again after assigning a custom accessory.
             guard applied != appearance else { return }
@@ -261,7 +262,7 @@ struct PhoneSessionList: UIViewControllerRepresentable {
                 glyph.sizeToFit()
                 if accessoryView !== glyph { accessoryView = glyph }
             }
-            accessibilityLabel = title
+            accessibilityLabel = agent.map { title + "，" + $0 } ?? title
             accessibilityTraits = accessory == .empty ? .staticText : .button
             switch accessory {
             case .expanded: accessibilityValue = "已展开"

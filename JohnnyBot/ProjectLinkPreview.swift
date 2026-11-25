@@ -1,4 +1,5 @@
 import SwiftUI
+import WebKit
 import CodeEditorView
 import LanguageSupport
 import SwiftStreamingMarkdown
@@ -138,10 +139,15 @@ private struct ProjectFilePreview: View {
     let client: ACPClient
     let session: String?
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.colorScheme) private var colorScheme
+    @State private var firstPage: String?
     @State private var source: String?
     @State private var error: String?
     @State private var position = CodeEditor.Position()
+    @State private var showingSource = false
+
+    private var isHTML: Bool {
+        ["html", "htm"].contains((file.path as NSString).pathExtension.lowercased())
+    }
 
     private var language: LanguageConfiguration? {
         switch previewHighlightLanguage(for: file.path) {
@@ -169,16 +175,33 @@ private struct ProjectFilePreview: View {
             }.padding()
             Divider()
 #endif
+            if isHTML {
+                HStack {
+                    Spacer()
+                    Picker("HTML 显示方式", selection: $showingSource) {
+                        Text("网页").tag(false)
+                        Text("源码").tag(true)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .fixedSize()
+                    Spacer()
+                }
+                .padding(.vertical, 6)
+                Divider()
+            }
             if let source {
-                if let language {
-                    ReadOnlyEditor(editor: CodeEditor(text: .constant(source), position: $position,
-                                                      messages: .constant([]), language: language)
-                        .environment(\.codeEditorTheme, colorScheme == .dark ? Theme.defaultDark : Theme.defaultLight))
+                if isHTML && !showingSource {
+                    HTMLReportView(source: source)
+                } else if let language {
+                    ProjectCodeEditor(source: source, position: $position, language: language)
                 } else {
                     HighlightedFile(source: source, path: file.path, line: file.line)
                 }
             } else if let error {
                 ContentUnavailableView("无法预览文件", systemImage: "doc.text", description: Text(error))
+            } else if let firstPage, !isHTML || showingSource {
+                HighlightedFileText(text: AttributedString(firstPage), line: file.line)
             } else {
                 ProgressView("正在读取文件").frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -187,8 +210,13 @@ private struct ProjectFilePreview: View {
         .frame(minWidth: 560, maxWidth: .infinity, minHeight: 380, maxHeight: .infinity)
 #endif
         .task {
+            showingSource = file.line != nil
             do {
-                let text = try await client.readProjectFile(file.path, session: session, workspace: file.workspace)
+                let text = try await client.readProjectFile(file.path, session: session, workspace: file.workspace) { prefix in
+                    firstPage = prefix
+                }
+                try Task.checkCancellation()
+                firstPage = nil
                 if let line = file.line, line > 1 {
                     let start = text.lineRangeStart(line)
                     position = .init(selections: [NSRange(location: start, length: 0)], verticalScrollPosition: 0)
@@ -198,6 +226,31 @@ private struct ProjectFilePreview: View {
         }
     }
 }
+
+// Reports are fetched through the authenticated file API. WebKit only receives the document.
+struct HTMLReportView {
+    let source: String
+
+    fileprivate func makeWebView() -> WKWebView {
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .nonPersistent()
+        let view = WKWebView(frame: .zero, configuration: configuration)
+        view.loadHTMLString(source, baseURL: nil)
+        return view
+    }
+}
+
+#if os(macOS)
+extension HTMLReportView: NSViewRepresentable {
+    func makeNSView(context: Context) -> WKWebView { makeWebView() }
+    func updateNSView(_ view: WKWebView, context: Context) {}
+}
+#else
+extension HTMLReportView: UIViewRepresentable {
+    func makeUIView(context: Context) -> WKWebView { makeWebView() }
+    func updateUIView(_ view: WKWebView, context: Context) {}
+}
+#endif
 
 func previewHighlightLanguage(for path: String) -> String {
     let filename = (path as NSString).lastPathComponent.lowercased()
@@ -313,6 +366,19 @@ private extension String {
             offset = NSMaxRange(string.lineRange(for: NSRange(location: offset, length: 0)))
         }
         return offset
+    }
+}
+
+struct ProjectCodeEditor: View {
+    let source: String
+    @Binding var position: CodeEditor.Position
+    var language: LanguageConfiguration = .none
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        ReadOnlyEditor(editor: CodeEditor(text: .constant(source), position: $position,
+                                          messages: .constant([]), language: language)
+            .environment(\.codeEditorTheme, colorScheme == .dark ? Theme.defaultDark : Theme.defaultLight))
     }
 }
 

@@ -30,6 +30,19 @@ struct SessionDirectoryTests {
         #expect(directory.contains("a", in: all) == false)
     }
 
+    @Test func restoredRowPicksUpAgentFromSyncedList() throws {
+        let restored = ACPSession(id: "old", title: "恢复的会话")
+        directory.insert(restored, in: project, atFront: false)
+        #expect(restored.symbol(loaded: false) == "bubble.left")
+        let item = ListedSession(id: restored.id, title: restored.title, cwd: "/work", agent: "antigravity")
+        directory.replace([item], ids: [item.id], in: project, retaining: [], complete: true)
+        #expect(directory.session(id: restored.id) === restored)
+        #expect(restored.symbol(loaded: false) == "a.circle")
+        #expect(restored.agentName == "Antigravity")
+        #expect(restored.symbol(loaded: true) == "a.circle.fill")
+        #expect(ACPSession.symbol(for: "codex") == "c.circle")
+    }
+
     @Test func mergesFirstPageAndFullListWithLocallyLoadedSessions() throws {
         let local = ACPSession(id: "local", title: "local")
         directory.insert(local, in: project, atFront: true)

@@ -304,7 +304,7 @@ struct MacSessionList: View {
                 let client = model.client, session = entry.session
                 cell.bind {
                     let approval = client.permissions.contains { $0.sessionID == session.id }
-                    return .init(session.title, icon: client.loaded.contains(session.id) ? "bubble.left.fill" : "bubble.left",
+                    return .init(session.title, icon: session.symbol(loaded: client.loaded.contains(session.id)), agent: session.agentName,
                                  approval: approval, responding: client.prompting.contains(session.id))
                 }
             } else {
@@ -373,14 +373,16 @@ struct MacSessionList: View {
         struct Appearance: Equatable {
             let title: String
             var icon: String?
+            var agent: String?
             var secondary: Bool
             var approval: Bool
             var responding: Bool
 
-            init(_ title: String, icon: String? = nil, secondary: Bool = false,
+            init(_ title: String, icon: String? = nil, agent: String? = nil, secondary: Bool = false,
                  approval: Bool = false, responding: Bool = false) {
                 self.title = title
                 self.icon = icon
+                self.agent = agent
                 self.secondary = secondary
                 self.approval = approval
                 self.responding = responding
@@ -388,7 +390,7 @@ struct MacSessionList: View {
         }
         private var render: (() -> Appearance)?
         private var applied: Appearance?
-        private static let icons = ["folder", "folder.fill", "bubble.left", "bubble.left.fill", "lock.shield"]
+        private static let icons = ["folder", "folder.fill", "bubble.left", "bubble.left.fill", "lock.shield", "c.circle", "c.circle.fill", "a.circle", "a.circle.fill", "p.circle", "p.circle.fill"]
             .reduce(into: [String: NSImage]()) { $0[$1] = NSImage(systemSymbolName: $1, accessibilityDescription: nil) }
 
         init() {
@@ -418,6 +420,8 @@ struct MacSessionList: View {
             }
             guard let appearance, appearance != applied else { return }
             applied = appearance
+            toolTip = appearance.agent
+            setAccessibilityValue(appearance.agent)
             display(appearance.title, icon: appearance.icon, secondary: appearance.secondary,
                     approval: appearance.approval, responding: appearance.responding)
         }
