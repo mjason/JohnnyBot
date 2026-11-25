@@ -98,16 +98,15 @@ struct SessionTranscript: View {
             .padding(.horizontal, horizontalMargin)
             .padding(.top, 20)
             .padding(.bottom, max(8, composerSpacing))
-            // Keep the blank space above a short conversation inside the scroll document.
-            .frame(maxWidth: .infinity, minHeight: minHeight, alignment: .bottom)
+            // Anchor short replies at the top so each new line grows downwards.
+            .frame(maxWidth: .infinity, minHeight: minHeight, alignment: .top)
         }
         .environment(\.transcriptMarkdownCache, markdownCache)
         .scrollPosition($position)
         .defaultScrollAnchor(.bottom)
+        .defaultScrollAnchor(.top, for: .alignment)
 #if os(macOS)
         .scrollBounceBehavior(.basedOnSize, axes: .vertical)
-#elseif os(iOS)
-        .defaultScrollAnchor(.top, for: .alignment)
 #endif
         .onChange(of: timeline.rows.count) { previousCount, count in
             if count > previousCount, timeline.rows.last?.turn.user != nil {
@@ -467,7 +466,7 @@ private struct TranscriptMarkdownDocument: View {
     }
 
     @Environment(\.transcriptMarkdownCache) private var cache
-    @State private var parsed: (text: String, document: RenderableDocument)?
+    @State private var parsed: (snapshot: Snapshot, document: RenderableDocument)?
     private final class Updates {
         var latest: Snapshot?
         var continuation: AsyncStream<Snapshot>.Continuation?
@@ -498,22 +497,25 @@ private struct TranscriptMarkdownDocument: View {
             defer { continuation.finish() }
             continuation.yield(updates.latest ?? snapshot)
             let parser = MarkdownParserImpl()
-            for await next in stream {
+            let clock = ContinuousClock()
+            var nextUpdate = clock.now
+            for await submitted in stream {
+                if submitted.isStreaming, clock.now < nextUpdate {
+                    try? await clock.sleep(until: nextUpdate)
+                }
+                let next = updates.latest ?? submitted
                 guard !Task.isCancelled else { break }
                 let document: RenderableDocument
-                if let parsed, parsed.text == next.text {
-                    document = parsed.document
+                if parsed?.snapshot == next {
+                    continue
                 } else if !next.isStreaming, let cache {
                     document = await cache.finishedDocument(for: entryID, text: next.text, size: textSize, config: config)
                 } else {
-                    document = await parser.parse(text: next.text, config: config)
+                    document = await parser.parse(text: next.text, config: config, speculativeRewrite: next.isStreaming)
                 }
                 guard !Task.isCancelled else { break }
-                if parsed?.text != next.text {
-                    parsed = (next.text, document)
-                } else if !next.isStreaming {
-                    cache?.store(document, for: entryID, text: next.text, size: textSize)
-                }
+                parsed = (next, document)
+                nextUpdate = clock.now.advanced(by: .milliseconds(16))
             }
         }
     }

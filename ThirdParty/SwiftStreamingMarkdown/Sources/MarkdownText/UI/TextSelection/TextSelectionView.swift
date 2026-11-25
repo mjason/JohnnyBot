@@ -9,9 +9,15 @@ import SwiftUI
 /// the user can select more than the tapped block. Presented by `DocumentView`
 /// when the built-in "Select more text" edit-menu action is invoked.
 struct TextSelectionView: View {
-  let text: String
+  @State private var text: String
   let backgroundColor: Color
   let onDismiss: () -> Void
+
+  init(text: String, backgroundColor: Color, onDismiss: @escaping () -> Void) {
+    _text = State(initialValue: text)
+    self.backgroundColor = backgroundColor
+    self.onDismiss = onDismiss
+  }
 
   var body: some View {
     VStack(spacing: 14) {

@@ -20,12 +20,17 @@ struct BlockView: View {
     VStack(alignment: .leading, spacing: config.blockSpacing) {
       ForEach(renderables) { renderable in
         SingleBlockView(renderable: renderable)
+          .equatable()
       }
     }
   }
 }
 
-struct SingleBlockView: View {
+struct SingleBlockView: View, Equatable {
+
+  static func == (lhs: Self, rhs: Self) -> Bool {
+    lhs.renderable == rhs.renderable
+  }
 
   @Environment(\.markdownConfig) var config: MarkdownRenderConfig
 

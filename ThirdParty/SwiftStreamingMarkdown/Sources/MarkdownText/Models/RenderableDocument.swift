@@ -18,6 +18,15 @@ import AppKit
 public struct RenderableDocument: Equatable, Sendable {
   let renderables: [MarkdownRenderable]
 
+  var hasStructuredSelection: Bool {
+    renderables.contains { block in
+      switch block {
+      case .orderedList, .unorderedList, .table, .blockQuote, .codeBlock: true
+      default: false
+      }
+    }
+  }
+
   var containsCodeBlock: Bool {
     return renderables.contains(where: { $0.isCodeBlock })
   }

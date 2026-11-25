@@ -67,3 +67,18 @@ extension NSAttributedString {
     return words
   }
 }
+
+
+extension NSTextStorage {
+  /// Preserve TextKit's layout and selection in the already displayed prefix.
+  func updateStreamingContents(_ contents: NSAttributedString) {
+    let previous = NSRange(location: 0, length: length)
+    if contents.length > previous.length,
+       contents.attributedSubstring(from: previous).isEqual(to: self) {
+      append(contents.attributedSubstring(from: NSRange(location: previous.length,
+                                                        length: contents.length - previous.length)))
+    } else {
+      setAttributedString(contents)
+    }
+  }
+}

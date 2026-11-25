@@ -114,7 +114,7 @@ class ParagraphUIView: UITextView {
     self.paragraphContents = newContents
     self.lineSpacing = lineSpacing
 
-    let oldAttributedString: NSAttributedString = attributedText
+    let oldLength = textStorage.length
     let finalString: NSMutableAttributedString
     if lineSpacing != nil {
       finalString = applyLineSpacing(to: newContents, lineSpacing: lineSpacing)
@@ -122,25 +122,29 @@ class ParagraphUIView: UITextView {
       finalString = newContents
     }
 
-    guard finalString != oldAttributedString else {
+    guard !finalString.isEqual(to: textStorage) else {
       return
     }
 
     // Stop display link update before updating the attributed string
     tearDownDisplayLink()
     invalidateCachedSize()
-    attributedText = finalString
+    let selection = selectedRange
+    let preserveSelection = selection.length > 0 && NSMaxRange(selection) <= finalString.length &&
+      (textStorage.string as NSString).substring(with: selection) == (finalString.string as NSString).substring(with: selection)
+    textStorage.updateStreamingContents(finalString)
+    if preserveSelection && selectedRange != selection { selectedRange = selection }
 
     configureAccessibility(for: finalString)
 
     invalidateIntrinsicContentSize()
 
-    let newContentLength = attributedText.length - oldAttributedString.length
+    let newContentLength = attributedText.length - oldLength
 
     if animatedByWord,
        newContentLength > 0 {
       // Animate word by word
-      let newContentRange = NSRange(location: oldAttributedString.length, length: newContentLength)
+      let newContentRange = NSRange(location: oldLength, length: newContentLength)
       let wordRanges = attributedText.splitIntoWords(withIn: newContentRange)
       let wordCount = wordRanges.count
       let delayBetweenWords: Double = ParagraphAnimationConstants.delayBetweenWordsRatio / Double(wordCount)

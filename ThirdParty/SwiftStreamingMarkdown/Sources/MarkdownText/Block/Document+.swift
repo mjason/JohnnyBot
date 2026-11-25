@@ -10,8 +10,17 @@ import SwiftUI
 extension Markdown.Document {
 
   func convert(with config: MarkdownRenderConfig) -> [MarkdownRenderable] {
-    return self
-      .blockConvertibleChildren
-      .map { $0.convert(attributeContainer: NSAttributeContainer(), config: config) }
+    var blocks: [MarkdownRenderable] = []
+    for child in blockConvertibleChildren {
+      let block = child.convert(attributeContainer: NSAttributeContainer(), config: config)
+      // Consecutive prose shares a native selection and a stable text view as it grows.
+      if case .paragraph(_, let next) = block, case .paragraph(_, let previous)? = blocks.last {
+        previous.append(NSAttributedString(string: "\n\n", attributes: [.font: config.paragraphStyle.textFonts.normal]))
+        previous.append(next)
+      } else {
+        blocks.append(block)
+      }
+    }
+    return blocks
   }
 }

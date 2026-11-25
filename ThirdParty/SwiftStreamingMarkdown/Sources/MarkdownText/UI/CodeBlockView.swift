@@ -31,10 +31,17 @@ struct CodeBlockView: View {
   }
 
   private var renderedCode: AttributedString {
-    guard let highlighted, highlighted.request == highlightRequest else {
+    let request = highlightRequest
+    guard let highlighted, highlighted.request.language == request.language,
+          highlighted.request.colors == request.colors else {
       return AttributedString(code)
     }
-    return highlighted.text
+    if highlighted.request.code == code { return highlighted.text }
+    // Keep the previous colors while the highlighter catches up with an append.
+    guard let prefix = code.range(of: highlighted.request.code, options: [.anchored, .literal]) else {
+      return AttributedString(code)
+    }
+    return highlighted.text + AttributedString(String(code[prefix.upperBound...]))
   }
 
   private var backgroundColor: Color? {
@@ -98,40 +105,23 @@ struct CodeBlockView: View {
   }
 
   var body: some View {
-    VStack(spacing: 0) {
-      HStack(alignment: .top) {
-        Text(language)
+    VStack(alignment: .leading, spacing: 0) {
+      HStack {
+        Text(language.isEmpty ? "Code" : language)
           .font(config.codeBlockConfig.chromeTextFonts)
           .foregroundStyle(foregroundColor)
         Spacer()
         copyButton
-      }.frame(maxWidth: .infinity)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .background(
-          backgroundColor
-            .clipShape(.rect(
-              topLeadingRadius: 20,
-              bottomLeadingRadius: 0,
-              bottomTrailingRadius: 0,
-              topTrailingRadius: 20
-            ))
-        )
+      }
+      .padding(.horizontal, 14)
+      .padding(.vertical, 4)
+      Divider().accessibilityHidden(true)
       codeblock
         .fixedSize(horizontal: false, vertical: true)
         .scrollIndicators(.automatic)
-        .if(backgroundColor != nil, content: { view in
-          let color = backgroundColor ?? Color.clear
-          return view.background(color
-            .clipShape(.rect(
-              topLeadingRadius: 0,
-              bottomLeadingRadius: 20,
-              bottomTrailingRadius: 20,
-              topTrailingRadius: 0
-            ))
-          )
-        })
-    }.onChange(of: copied, perform: { isCopied in
+    }
+    .background(backgroundColor ?? .clear, in: RoundedRectangle(cornerRadius: 12))
+    .onChange(of: copied, perform: { isCopied in
       if isCopied {
         Task {
           try await Task.sleep(seconds: 3)

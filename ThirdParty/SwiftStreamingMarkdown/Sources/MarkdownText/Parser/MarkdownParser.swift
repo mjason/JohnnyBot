@@ -31,10 +31,10 @@ extension MarkdownParser {
   ///   - text: The incoming text.
   ///   - config: Render configuration applied when building the renderable.
   /// - Returns: A `RenderableDocument` built from the parsed `Document`.
-  public func parse(text: String, config: MarkdownRenderConfig) async -> RenderableDocument {
+  public func parse(text: String, config: MarkdownRenderConfig, speculativeRewrite: Bool = false) async -> RenderableDocument {
     let document = await parse(
       text: text,
-      option: .init(speculativeRewrite: false, imageSupport: config.imageConfig.enabled)
+      option: .init(speculativeRewrite: speculativeRewrite, imageSupport: config.imageConfig.enabled)
     ).document
     return await RenderableDocument(document: document, config: config)
   }

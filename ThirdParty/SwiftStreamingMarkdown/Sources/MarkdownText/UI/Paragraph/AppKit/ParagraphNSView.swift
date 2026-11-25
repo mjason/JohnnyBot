@@ -144,7 +144,13 @@ class ParagraphNSView: NSTextView {
 
     tearDownDisplayLink()
     invalidateCachedSize()
-    textStorage?.setAttributedString(finalString)
+    let selection = selectedRange()
+    let preserveSelection = selection.length > 0 && NSMaxRange(selection) <= finalString.length &&
+      (string as NSString).substring(with: selection) == (finalString.string as NSString).substring(with: selection)
+    textStorage?.updateStreamingContents(finalString)
+    if preserveSelection && selectedRange() != selection {
+      setSelectedRange(selection)
+    }
 
     configureAccessibility(for: finalString)
 
@@ -338,6 +344,13 @@ class ParagraphNSView: NSTextView {
     } else if let string = link as? String, let url = URL.fromMixedEncodingString(string) {
       onUrlTap(url)
     }
+  }
+
+  override func writeSelection(to pasteboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Bool {
+    guard type == .string else { return super.writeSelection(to: pasteboard, type: type) }
+    let range = selectedRange()
+    guard range.length > 0, NSMaxRange(range) <= (string as NSString).length else { return false }
+    return pasteboard.setString((string as NSString).substring(with: range), forType: type)
   }
 
   // MARK: - Context Menu

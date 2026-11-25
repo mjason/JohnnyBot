@@ -49,7 +49,7 @@ actor HighlightTaskManager: ObservableObject {
       let mode = language.map(HighlightMode.languageAliasIgnoreIllegal) ?? .automatic
       if let result = try? await Self.sharedHighlight.request(request.code, mode: mode, colors: request.colors),
          pending == nil {
-        await completion(request, result.attributedText)
+        await completion(request, preservingWhitespace(in: request.code, styled: result.attributedText))
       }
     }
   }
@@ -59,6 +59,10 @@ actor HighlightTaskManager: ObservableObject {
 public func highlightSource(_ code: String, language: String, colorScheme: ColorScheme) async throws -> AttributedString {
   let colors = CodeBlockConfig.Theme.xcode.highlightColors(for: colorScheme)
   let styled = try await HighlightTaskManager.highlight(code, language: language, colors: colors)
+  return preservingWhitespace(in: code, styled: styled)
+}
+
+private func preservingWhitespace(in code: String, styled: AttributedString) -> AttributedString {
   let rendered = String(styled.characters)
   // The HTML decoder trims leading and trailing whitespace. Restore it for file previews.
   guard let range = code.range(of: rendered, options: .literal),

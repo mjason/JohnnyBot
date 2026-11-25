@@ -71,7 +71,7 @@ struct ParagraphView: NSViewRepresentable {
       return cachedSize
     }
 
-    let calculatedSize = nsView.measureSize(fittingWidth: width)
+    let calculatedSize = CGSize(width: width, height: nsView.measureSize(fittingWidth: width).height)
 
     context.coordinator.sizeCache[cacheKey] = calculatedSize
     return calculatedSize

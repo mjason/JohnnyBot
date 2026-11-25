@@ -34,7 +34,19 @@ public struct DocumentView: View {
   }
 
   public var body: some View {
-    BlockView(renderables: renderableDocument.renderables)
+    VStack(alignment: .leading, spacing: 6) {
+      BlockView(renderables: renderableDocument.renderables)
+      if config.textSelectionConfig.isEnabled, renderableDocument.renderables.count > 1 || renderableDocument.hasStructuredSelection {
+        Button {
+          controller.isTextSelectionRequested = true
+        } label: {
+          Label(String.selectMoreTextLabel, systemImage: "selection.pin.in.out")
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .buttonStyle(.borderless)
+      }
+    }
     .environment(\.markdownConfig, config)
     .environment(\.markdownController, controller)
     .task {
