@@ -143,6 +143,7 @@ final class ACPClient {
     var supportsSessionList: Bool { available }
     var supportsDirectoryListing: Bool { connected }
     private var capabilities: [String: Bool] = [:]
+    var supportsTerminalWait: Bool { capabilities["terminal_wait"] == true }
     var supportsRemoteShell: Bool { connected && capabilities["terminal"] == true }
     var supportsConfig: Bool { connected && capabilities["thread_config"] == true }
     var supportsMode: Bool { connected && capabilities["thread_mode"] == true }

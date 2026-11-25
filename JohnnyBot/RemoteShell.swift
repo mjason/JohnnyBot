@@ -41,8 +41,9 @@ final class RemoteShell: TerminalViewDelegate {
     @ObservationIgnored private weak var client: ACPClient?
     @ObservationIgnored private var project = ACPProject(path: nil)
     @ObservationIgnored private var reader: Task<Void, Never>?
+    @ObservationIgnored private var outputReader: Task<Void, Never>?
     @ObservationIgnored private var writer: Task<Void, Never>?
-    @ObservationIgnored private var inputs: AsyncStream<(String, Data)>.Continuation?
+    @ObservationIgnored private var pendingInput: [(id: String, bytes: Data)] = []
     @ObservationIgnored private var dimensions = (cols: 80, rows: 24)
     @ObservationIgnored private var offset = 0
     @ObservationIgnored private var generation = UUID()
@@ -70,43 +71,16 @@ final class RemoteShell: TerminalViewDelegate {
         self.project = project
         state = .connecting
         let ticket = generation
-        let (stream, continuation) = AsyncStream<(String, Data)>.makeStream(bufferingPolicy: .bufferingOldest(64))
-        inputs = continuation
-        writer = Task {
-            for await (id, data) in stream {
-                guard generation == ticket else { return }
-                do {
-                    try await client.command("terminal.input", ["terminal_id": id, "bytes": data.base64EncodedString()], write: true)
-                } catch { if generation == ticket { commandError = error.localizedDescription } }
-            }
-        }
         reader = Task {
             do {
                 try await refresh(client, ticket: ticket)
                 guard generation == ticket else { return }
                 if tabs.isEmpty { try await create(client, ticket: ticket) }
+                guard generation == ticket else { return }
                 state = .attached
-                var nextList = ContinuousClock.now
                 while !Task.isCancelled {
-                    if ContinuousClock.now >= nextList {
-                        try await refresh(client, ticket: ticket)
-                        nextList = .now.advanced(by: .seconds(2))
-                    }
-                    guard generation == ticket else { return }
-                    if let id = selectedTab, !isChangingTab {
-                        let start = offset
-                        let result = try await client.command("terminal.read", ["terminal_id": id, "offset": offset])
-                        guard generation == ticket else { return }
-                        if selectedTab == id, offset == start {
-                            if let terminal = result["terminal"] as? [String: Any] { updateAccess(terminal, client: client) }
-                            if result["reset"] as? Bool == true { view.resetToInitialState() }
-                            if let encoded = result["bytes"] as? String, let data = Data(base64Encoded: encoded), !data.isEmpty {
-                                view.feed(byteArray: Array(data)[...])
-                            }
-                            if let next = result["next_offset"] as? Int { offset = next }
-                        }
-                    }
-                    try await Task.sleep(for: .milliseconds(90))
+                    try await Task.sleep(for: .seconds(2))
+                    try await refresh(client, ticket: ticket)
                 }
             } catch {
                 if generation == ticket { detach(); state = .failed(error.localizedDescription) }
@@ -139,10 +113,48 @@ final class RemoteShell: TerminalViewDelegate {
     }
 
     private func switchTo(_ id: String?) {
+        outputReader?.cancel()
         selectedTab = id
         offset = 0
         access = nil
         view.resetToInitialState()
+        guard let id, let client else { return }
+        let ticket = generation
+        outputReader = Task {
+            do {
+                while !Task.isCancelled {
+                    var args: [String: Any] = ["terminal_id": id, "offset": offset]
+                    if client.supportsTerminalWait { args["wait_ms"] = 1500 }
+                    let result = try await client.command("terminal.read", args)
+                    try Task.checkCancellation()
+                    guard generation == ticket, selectedTab == id else { return }
+                    if let terminal = result["terminal"] as? [String: Any] { updateAccess(terminal, client: client) }
+                    if result["reset"] as? Bool == true { view.resetToInitialState() }
+                    if let next = result["next_offset"] as? Int { offset = next }
+                    if let encoded = result["bytes"] as? String, let data = Data(base64Encoded: encoded), !data.isEmpty {
+                        view.feed(byteArray: Array(data)[...])
+                    } else if !running {
+                        return
+                    } else if !client.supportsTerminalWait {
+                        try await Task.sleep(for: .milliseconds(90))
+                    }
+                }
+            } catch {
+                guard !Task.isCancelled, generation == ticket, selectedTab == id else { return }
+                do {
+                    try await refresh(client, ticket: ticket)
+                } catch {
+                    guard generation == ticket, !Task.isCancelled else { return }
+                    detach()
+                    state = .failed(error.localizedDescription)
+                    return
+                }
+                if generation == ticket && selectedTab == id && !Task.isCancelled {
+                    detach()
+                    state = .failed(error.localizedDescription)
+                }
+            }
+        }
     }
 
     private func create(_ client: ACPClient, ticket: UUID) async throws {
@@ -170,11 +182,13 @@ final class RemoteShell: TerminalViewDelegate {
     func detach() {
         generation = UUID()
         reader?.cancel()
+        outputReader?.cancel()
+        outputReader = nil
+        selectedTab = nil
         writer?.cancel()
         reader = nil
         writer = nil
-        inputs?.finish()
-        inputs = nil
+        pendingInput.removeAll()
         client = nil
         isChangingTab = false
         state = .detached
@@ -200,13 +214,14 @@ final class RemoteShell: TerminalViewDelegate {
         guard let index = previous.firstIndex(where: { $0.id == id }) else { return }
         hiddenTabs.insert(id)
         let remaining = visibleTabs
-        if selectedTab == id, !remaining.isEmpty {
-            selectTab(remaining[min(index, remaining.count - 1)].id)
+        if selectedTab == id {
+            switchTo(remaining.isEmpty ? nil : remaining[min(index, remaining.count - 1)].id)
         }
     }
 
     func restoreHiddenTabs() {
         hiddenTabs.removeAll()
+        if selectedTab == nil { switchTo(visibleTabs.first?.id) }
     }
 
     func takeControl() {
@@ -244,15 +259,39 @@ final class RemoteShell: TerminalViewDelegate {
     }
 
     func send(source: TerminalView, data: ArraySlice<UInt8>) {
-        guard canSendInput, !isChangingTab, let id = selectedTab else { return }
+        guard canSendInput, !isChangingTab, let id = selectedTab, let client, !data.isEmpty else { return }
         var remaining = data
         while !remaining.isEmpty {
-            let chunk = remaining.prefix(32768)
-            if case .dropped? = inputs?.yield((id, Data(chunk))) {
+            let last = pendingInput.indices.last
+            if let last, pendingInput[last].id == id, pendingInput[last].bytes.count < 32768 {
+                let chunk = remaining.prefix(32768 - pendingInput[last].bytes.count)
+                pendingInput[last].bytes.append(contentsOf: chunk)
+                remaining = remaining.dropFirst(chunk.count)
+            } else if pendingInput.count < 64 {
+                let chunk = remaining.prefix(32768)
+                pendingInput.append((id, Data(chunk)))
+                remaining = remaining.dropFirst(chunk.count)
+            } else {
                 commandError = "终端输入队列已满，后续内容尚未发送"
-                return
+                break
             }
-            remaining = remaining.dropFirst(chunk.count)
+        }
+        guard writer == nil else { return }
+        let ticket = generation
+        writer = Task {
+            defer { if generation == ticket { writer = nil } }
+            while generation == ticket && !pendingInput.isEmpty {
+                let next = pendingInput.removeFirst()
+                do {
+                    try await client.command("terminal.input", ["terminal_id": next.id, "bytes": next.bytes.base64EncodedString()], write: true)
+                } catch {
+                    if generation == ticket {
+                        pendingInput.removeAll()
+                        commandError = error.localizedDescription
+                    }
+                    return
+                }
+            }
         }
     }
 

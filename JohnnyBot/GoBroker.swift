@@ -99,7 +99,9 @@ final class GoBroker {
             guard let leaf = (SecTrustCopyCertificateChain(secTrust) as? [SecCertificate])?.first else { complete(false); return }
             complete(SHA256.hash(data: SecCertificateCopyData(leaf) as Data).hexString == pin)
         }, DispatchQueue.main)
-        connection = NWConnection(host: .init(host), port: port, using: NWParameters(tls: tls, tcp: .init()))
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        connection = NWConnection(host: .init(host), port: port, using: NWParameters(tls: tls, tcp: tcp))
     }
 
     func start() async throws {
