@@ -35,9 +35,9 @@ final class JohnnyBotUITests: XCTestCase {
 
 #if os(iOS)
     @MainActor
-    func testPhoneConnectionRequiresAddressAndToken() throws {
+    func testPhoneConnectionRequiresAddressAndFingerprint() throws {
         let app = XCUIApplication()
-        app.launchArguments = ["-acpServerAddresses", "()"]
+        app.launchArguments = ["-mqttServerAddresses", "()"]
         app.launch()
 
         let connect = app.buttons["连接服务器"]
@@ -45,13 +45,13 @@ final class JohnnyBotUITests: XCTestCase {
         XCTAssertFalse(connect.isEnabled)
         let address = app.textFields["服务器地址"]
         address.tap()
-        address.typeText("ws://example.invalid/acp\n")
+        address.typeText("mqtts://example.invalid:8883/test\n")
         XCTAssertFalse(connect.isEnabled)
-        app.secureTextFields.firstMatch.typeText("test-token")
+        app.textFields["SHA-256 指纹"].typeText(String(repeating: "a", count: 64))
         XCTAssertTrue(connect.isEnabled)
         let keyboard = app.keyboards.firstMatch
         XCTAssertTrue(keyboard.exists)
-        app.staticTexts["填写设备可以访问的 ACP 服务器地址。"].tap()
+        app.staticTexts["末尾的服务标识取自 Go 服务的 -host 参数。"].tap()
         XCTAssertTrue(keyboard.waitForNonExistence(timeout: 5))
         XCTAssertTrue(connect.isEnabled)
     }

@@ -1,17 +1,19 @@
 # JohnnyBot
 
-JohnnyBot 是 macOS 和 iOS 上的 ACP 客户端。它通过 WebSocket 连接远端 Agent，按项目目录组织会话，并提供独立的远程终端。
+JohnnyBot 是 macOS 和 iOS 上的 ACP 客户端。它通过 MQTT 5 和 TLS 1.3 连接 Johnny Bot Go 服务，按项目目录组织会话，并提供独立的远程终端。
 
 - 会话支持流式 Markdown、工具调用折叠、模型与思考模式切换，以及截图和文件附件。可用能力由服务端声明。
 - 远程终端支持多个标签、跨设备续接和控制权交接。macOS 上可用 `⌘T` 新建标签、`⌘W` 关闭当前标签。
 
 ## 构建和连接
 
-1. 按 [johnny-server 的说明](https://github.com/mjason/johnny-server#启动)启动服务端，并生成共享令牌。
-2. 用包含 macOS 和 iOS 26.5 SDK 的 Xcode 打开 `JohnnyBot.xcodeproj`，运行 `JohnnyBot` scheme。iOS 真机安装需要在 Xcode 里配置自己的签名团队。
-3. 在客户端填入服务端的 ACP WebSocket 地址和共享令牌。同一台电脑可以用 `ws://127.0.0.1:8765/acp`。从其他设备连接时，使用服务端在可信局域网中的地址，或使用配置了 TLS 的 `wss://` 入口。
+1. 启动 Go 服务的 `johnnybot serve`，记下监听地址、`-host` 标识和 SHA-256 证书指纹。
+2. 用包含 macOS 和 iOS 26.5 或更高版本 SDK 的 Xcode 打开 `JohnnyBot.xcodeproj`，运行 `JohnnyBot` scheme。iOS 真机安装需要配置签名团队。
+3. 在客户端选择「复制设备公钥」，将公钥单独一行追加到 Go 服务数据目录的 `authorized_keys`。每台设备各自配对，私钥保存在设备钥匙串中。
+4. 填入 `mqtts://主机:8883/服务标识` 和通过可信渠道取得的证书指纹，点击「连接」。开发时可以用 `JOHNNY_MQTT_URL` 指定初始地址。
+5. 在工作区的菜单中发现已有 Agent 会话，或创建新会话。打开过的会话同步到本机 SQLite。设备断线时可以继续阅读和排队发送，重连后按原命令 ID 同步。
 
-本地开发时可以通过 `JOHNNY_ACP_URL` 设置初始连接地址。也可以在客户端导入只含 `TOKEN` 的 `.env` 文件。
+远程终端支持实际 PTY 输入、调整大小、跨设备接管和重连续读。模型、模式和永久删除取决于服务端和当前 Agent 的能力。
 
 ## 发布 macOS 版
 

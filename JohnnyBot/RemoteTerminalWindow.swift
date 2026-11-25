@@ -9,12 +9,12 @@ final class RemoteTerminalWindows {
         let client: ACPClient
         let project: ACPProject
         let shell = RemoteShell()
-        var request: URLRequest
+        let address: String
 
-        init(client: ACPClient, project: ACPProject, request: URLRequest) {
+        init(client: ACPClient, project: ACPProject) {
             self.client = client
             self.project = project
-            self.request = request
+            self.address = client.address
         }
     }
 
@@ -28,12 +28,11 @@ final class RemoteTerminalWindows {
     }
 
     func session(for client: ACPClient, project: ACPProject) throws -> Session {
-        let request = try client.shellRequest()
-        if let session = sessions.first(where: { $0.client === client && $0.project == project && $0.request.url == request.url }) {
-            session.request = request
+        guard client.supportsRemoteShell else { throw ACPFailure(message: "请先连接支持终端的服务器") }
+        if let session = sessions.first(where: { $0.client === client && $0.project == project && $0.address == client.address }) {
             return session
         }
-        let session = Session(client: client, project: project, request: request)
+        let session = Session(client: client, project: project)
         sessions.append(session)
         return session
     }
@@ -455,11 +454,11 @@ struct RemoteTerminalWindow: View {
 
     private func newTab() {
         if shell.state == .empty { attach() }
-        else { shell.createTab(in: session.project.path) }
+        else { shell.createTab() }
     }
 
     private func closesRemotely(_ tab: RemoteShell.Tab) -> Bool {
-        shell.access == nil || (tab.id == shell.selectedTab && shell.canSendInput)
+        tab.id == shell.selectedTab && shell.access?.hasControl == true
     }
 
     private func requestClose(_ tab: RemoteShell.Tab) {
@@ -532,30 +531,11 @@ struct RemoteTerminalWindow: View {
             }
             Spacer()
             if shell.state == .attached, shell.activeTab != nil, let access = shell.access {
-                Label(access.hasControl ? "控制中" : "观看中", systemImage: access.hasControl ? "keyboard" : "eye")
+                Label(shell.running ? (access.hasControl ? "控制中" : "观看中") : "进程已退出", systemImage: access.hasControl ? "keyboard" : "eye")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-                if access.hasControl {
-                    Button("交出控制", action: shell.releaseControl)
-                        .buttonStyle(.bordered)
-                        .disabled(!canChangeTabs)
-                } else if let tab = shell.selectedTab {
-                    Menu {
-                        ForEach(RemoteShell.ViewportDirection.allCases) { direction in
-                            Button(direction.label, systemImage: direction.icon) { shell.moveViewport(direction) }
-                        }
-                    } label: {
-                        toolbarIcon("移动画面", systemImage: "arrow.up.left.and.down.right")
-                            .frame(minWidth: tabHeight, minHeight: max(32, tabHeight))
-                            .background(.quaternary, in: Capsule())
-                    }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
-                    .accessibilityIdentifier("remote-terminal-viewport")
-                    .help("移动观看画面")
-                    .disabled(!canChangeTabs)
-
+                if !access.hasControl, let tab = shell.selectedTab {
                     Button(access.hasController ? "接管" : "开始控制") {
                         if access.hasController { confirmation = .takeControl(tab) }
                         else { shell.takeControl() }
@@ -563,7 +543,7 @@ struct RemoteTerminalWindow: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(!canChangeTabs)
                 }
-            } else if shell.state == .attached, let host = session.request.url?.host {
+            } else if shell.state == .attached, let host = URL(string: session.address)?.host {
                 Label {
                     Text(host)
                 } icon: {
@@ -590,7 +570,7 @@ struct RemoteTerminalWindow: View {
         .frame(minHeight: 31)
     }
 
-    private func attach() { shell.attach(request: session.request, directory: session.project.path) }
+    private func attach() { shell.attach(client: session.client, project: session.project) }
 }
 
 #if os(macOS)

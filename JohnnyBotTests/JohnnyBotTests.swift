@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import CryptoKit
 import Testing
 @testable import JohnnyBot
 #if os(macOS)
@@ -32,29 +33,46 @@ struct JohnnyBotTests {
         #expect(restore("A").isEmpty)
     }
 
-    @Test func remembersServerTokensIndependentlyAcrossClientInstances() throws {
-        let first = "wss://test.invalid/" + UUID().uuidString
-        let second = first + "/other"
-        defer {
-            try? ServerCredentialStore.remove(first)
-            try? ServerCredentialStore.remove(second)
-        }
-        try ServerCredentialStore.save("first-test-token", for: first)
-        try ServerCredentialStore.save("second-test-token", for: second)
-        try ServerCredentialStore.save("rotated-test-token", for: first)
-        #expect(try ServerCredentialStore.token(for: first) == "rotated-test-token")
-        try ServerCredentialStore.remove(first)
-        #expect(try ServerCredentialStore.token(for: first) == nil)
-        #expect(try ServerCredentialStore.token(for: second) == "second-test-token")
+    @Test func identityIsStableAndExportsOpenSSHPublicKey() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let identity = DeviceIdentity(key: key)
+        let restored = DeviceIdentity(key: try .init(rawRepresentation: key.rawRepresentation))
+        #expect(restored.id == identity.id && identity.id.count == 32)
+        let parts = identity.publicLine.split(separator: " ")
+        #expect(parts.first == "ssh-ed25519")
+        let bytes = try #require(Data(base64Encoded: String(parts[1])))
+        #expect(bytes == Data([0, 0, 0, 11]) + Data("ssh-ed25519".utf8) + Data([0, 0, 0, 32]) + key.publicKey.rawRepresentation)
     }
 
-    @Test func findsTheHomeDirectoryOnOlderServers() {
-        let client = ACPClient(address: "", token: "")
-
-        #expect(client.projectHomeDirectory(defaultPath: "/home/mj/dev/project") == "/home/mj")
-        #expect(client.projectHomeDirectory(defaultPath: "/Users/example/project") == "/Users/example")
-        #expect(client.projectHomeDirectory(defaultPath: "/root/workspace") == "/root")
-        #expect(client.projectHomeDirectory(defaultPath: "/srv/project") == nil)
+    @Test func resumesFragmentedPagesAndRejectsStaleReplies() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let scope = "thread/demo"
+        func page(after: Int64, seq: Int64, part: Int64, last: Bool, text: String) -> [String: Any] {
+            let fragment: [String: Any] = ["id": "f", "kind": "session.setup", "part": part, "last": last,
+                                           "bytes": Data(text.utf8).base64EncodedString()]
+            return ["scope": scope, "epoch": "one", "after": after, "through": Int64(17), "more": !last,
+                    "events": [["seq": seq, "kind": "event.fragment", "data": fragment]]]
+        }
+        let first = try GoReplica(name: "test", directory: directory)
+        let initial = try first.cursor(scope)
+        let a = page(after: 0, seq: 3, part: 0, last: false, text: "{\"ok\":")
+        #expect(try first.apply(a, scope: scope, expected: initial, epoch: "one").isEmpty)
+        let second = try GoReplica(name: "test", directory: directory)
+        let checkpoint = try second.cursor(scope)
+        #expect(checkpoint.after == 3 && checkpoint.through == 17)
+        #expect(throws: ACPFailure.self) { try second.apply(a, scope: scope, expected: initial, epoch: "one") }
+        let b = page(after: 3, seq: 17, part: 1, last: true, text: "true}")
+        let emitted = try second.apply(b, scope: scope, expected: checkpoint, epoch: "one")
+        #expect(emitted.count == 1 && emitted.first?.data["ok"] as? Bool == true)
+        #expect(try first.history(scope).count == 1)
+        #expect(try first.cursor(scope).through == 0)
+        let payload = Data("original bytes".utf8)
+        try first.queue(id: "queued", epoch: "one", payload: payload)
+        #expect(try second.pending(epoch: "two").isEmpty)
+        #expect(try second.pending(epoch: "one").first?.payload == payload)
+        try second.complete(id: "queued", reply: ["ok": true])
+        #expect(try first.pending(epoch: "one").isEmpty)
     }
 
     @Test func groupsIntermediateWorkWithoutHidingTheFinalResponse() throws {
@@ -101,7 +119,7 @@ struct JohnnyBotTests {
 
         let url = URL(filePath: "/remote/preview-\(UUID()).swift")
         let link = FileLink(url: url).modifier(ProjectLinkPreview(
-            client: ACPClient(address: "", token: ""), session: "preview"
+            client: ACPClient(address: ""), session: "preview"
         ))
         let parent = NSWindow(contentViewController: NSHostingController(rootView: link))
         parent.orderBack(nil)

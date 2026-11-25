@@ -13,39 +13,6 @@ final class RemoteShell: TerminalViewDelegate {
         case detached, connecting, attached, empty, ended(Int), failed(String)
     }
 
-    private struct Request: Encodable {
-        let type: String
-        var cwd: String?
-        var tab: String?
-        var cols: Int?
-        var rows: Int?
-        var direction: ViewportDirection?
-    }
-
-    enum ViewportDirection: String, Encodable, CaseIterable, Identifiable {
-        case left, right, up, down, follow
-
-        var id: Self { self }
-        var label: String {
-            switch self {
-            case .left: "向左"
-            case .right: "向右"
-            case .up: "向上"
-            case .down: "向下"
-            case .follow: "跟随光标"
-            }
-        }
-        var icon: String {
-            switch self {
-            case .left: "arrow.left"
-            case .right: "arrow.right"
-            case .up: "arrow.up"
-            case .down: "arrow.down"
-            case .follow: "scope"
-            }
-        }
-    }
-
     struct Access: Equatable {
         let hasControl: Bool
         let hasController: Bool
@@ -58,23 +25,6 @@ final class RemoteShell: TerminalViewDelegate {
         let command: String?
     }
 
-    private struct Event: Decodable {
-        let type: String
-        var cwd: String?
-        var code: Int?
-        var message: String?
-        var tabs: [Tab]?
-        var selectedTab: String?
-        var completed: Bool?
-        var tab: String?
-        var hasControl: Bool?
-        var hasController: Bool?
-
-        var access: Access? {
-            hasControl.map { Access(hasControl: $0, hasController: hasController ?? $0) }
-        }
-    }
-
     private(set) var state: State = .detached
     private(set) var tabs: [Tab] = []
     private(set) var selectedTab: String?
@@ -85,14 +35,17 @@ final class RemoteShell: TerminalViewDelegate {
 
     var visibleTabs: [Tab] { tabs.filter { !hiddenTabs.contains($0.id) } }
     var activeTab: Tab? { visibleTabs.first { $0.id == selectedTab } }
-    var canSendInput: Bool { state == .attached && activeTab != nil && (access?.hasControl ?? true) }
+    private(set) var running = false
+    var canSendInput: Bool { running && state == .attached && activeTab != nil && (access?.hasControl == true) }
 
-    @ObservationIgnored private var socket: URLSessionWebSocketTask?
+    @ObservationIgnored private weak var client: ACPClient?
+    @ObservationIgnored private var project = ACPProject(path: nil)
     @ObservationIgnored private var reader: Task<Void, Never>?
     @ObservationIgnored private var writer: Task<Void, Never>?
-    @ObservationIgnored private var outgoing: AsyncStream<URLSessionWebSocketTask.Message>.Continuation?
+    @ObservationIgnored private var inputs: AsyncStream<(String, Data)>.Continuation?
     @ObservationIgnored private var dimensions = (cols: 80, rows: 24)
-    @ObservationIgnored private var closingLastTab = false
+    @ObservationIgnored private var offset = 0
+    @ObservationIgnored private var generation = UUID()
 
     @ObservationIgnored private(set) lazy var view: TerminalView = {
 #if os(macOS)
@@ -110,57 +63,138 @@ final class RemoteShell: TerminalViewDelegate {
         return view
     }()
 
-    func attach(request: URLRequest, directory: String?) {
-        guard socket == nil else { return }
-        view.resetToInitialState()
+    func attach(client: ACPClient, project: ACPProject) {
+        guard self.client == nil || state == .empty else { return }
+        detach()
+        self.client = client
+        self.project = project
         state = .connecting
-        let connection = URLSession.shared.webSocketTask(with: request)
-        connection.maximumMessageSize = 1024 * 1024
-        socket = connection
-        let (messages, continuation) = AsyncStream<URLSessionWebSocketTask.Message>.makeStream(bufferingPolicy: .bufferingOldest(256))
-        outgoing = continuation
-        enqueue(Request(type: "attach", cwd: directory, tab: selectedTab, cols: dimensions.cols, rows: dimensions.rows))
-        connection.resume()
-
-        writer = Task { [weak self] in
-            do {
-                for await message in messages { try await connection.send(message) }
-            } catch {
-                self?.connectionFailed(connection, error: error)
+        let ticket = generation
+        let (stream, continuation) = AsyncStream<(String, Data)>.makeStream(bufferingPolicy: .bufferingOldest(64))
+        inputs = continuation
+        writer = Task {
+            for await (id, data) in stream {
+                guard generation == ticket else { return }
+                do {
+                    try await client.command("terminal.input", ["terminal_id": id, "bytes": data.base64EncodedString()], write: true)
+                } catch { if generation == ticket { commandError = error.localizedDescription } }
             }
         }
-        reader = Task { [weak self] in
+        reader = Task {
             do {
+                try await refresh(client, ticket: ticket)
+                guard generation == ticket else { return }
+                if tabs.isEmpty { try await create(client, ticket: ticket) }
+                state = .attached
+                var nextList = ContinuousClock.now
                 while !Task.isCancelled {
-                    let message = try await connection.receive()
-                    guard let self, self.socket === connection else { return }
-                    self.receive(message)
+                    if ContinuousClock.now >= nextList {
+                        try await refresh(client, ticket: ticket)
+                        nextList = .now.advanced(by: .seconds(2))
+                    }
+                    guard generation == ticket else { return }
+                    if let id = selectedTab, !isChangingTab {
+                        let start = offset
+                        let result = try await client.command("terminal.read", ["terminal_id": id, "offset": offset])
+                        guard generation == ticket else { return }
+                        if selectedTab == id, offset == start {
+                            if let terminal = result["terminal"] as? [String: Any] { updateAccess(terminal, client: client) }
+                            if result["reset"] as? Bool == true { view.resetToInitialState() }
+                            if let encoded = result["bytes"] as? String, let data = Data(base64Encoded: encoded), !data.isEmpty {
+                                view.feed(byteArray: Array(data)[...])
+                            }
+                            if let next = result["next_offset"] as? Int { offset = next }
+                        }
+                    }
+                    try await Task.sleep(for: .milliseconds(90))
                 }
             } catch {
-                self?.connectionFailed(connection, error: error)
+                if generation == ticket { detach(); state = .failed(error.localizedDescription) }
             }
+        }
+    }
+
+    private func refresh(_ client: ACPClient, ticket: UUID) async throws {
+        let result = try await client.command("terminal.list", ["workspace_id": project.workspaceID])
+        guard generation == ticket else { return }
+        let all = (result["terminals"] as? [[String: Any]] ?? []).filter { $0["workspace_id"] as? String == project.workspaceID && $0["path"] as? String == project.relativePath }
+        let nextTabs: [Tab] = all.compactMap { item in
+            guard let id = item["terminal_id"] as? String else { return nil }
+            return Tab(id: id, title: item["title"] as? String ?? "终端", cwd: item["path"] as? String ?? ".", command: nil)
+        }
+        if nextTabs != tabs {
+            tabs = nextTabs
+            hiddenTabs.formIntersection(tabs.map(\.id))
+        }
+        if !tabs.contains(where: { $0.id == selectedTab }) { switchTo(visibleTabs.first?.id) }
+        if let item = all.first(where: { $0["terminal_id"] as? String == selectedTab }) { updateAccess(item, client: client) }
+    }
+
+    private func updateAccess(_ terminal: [String: Any], client: ACPClient) {
+        let owner = terminal["controller_device_id"] as? String ?? ""
+        let nextRunning = terminal["running"] as? Bool == true
+        let nextAccess = Access(hasControl: owner == client.deviceID, hasController: !owner.isEmpty)
+        if running != nextRunning { running = nextRunning }
+        if access != nextAccess { access = nextAccess }
+    }
+
+    private func switchTo(_ id: String?) {
+        selectedTab = id
+        offset = 0
+        access = nil
+        view.resetToInitialState()
+    }
+
+    private func create(_ client: ACPClient, ticket: UUID) async throws {
+        let result = try await client.command("terminal.create", ["workspace_id": project.workspaceID, "path": project.relativePath,
+                                                                  "cols": dimensions.cols, "rows": dimensions.rows], write: true)
+        guard generation == ticket else { return }
+        guard let terminal = result["terminal"] as? [String: Any], let id = terminal["terminal_id"] as? String else {
+            throw ACPFailure(message: "服务端未返回终端 ID")
+        }
+        switchTo(id)
+        try await refresh(client, ticket: ticket)
+    }
+
+    private func change(_ operation: @escaping (ACPClient, UUID) async throws -> Void) {
+        guard let client, !isChangingTab else { return }
+        let ticket = generation
+        isChangingTab = true
+        Task {
+            defer { if generation == ticket { isChangingTab = false } }
+            do { try await operation(client, ticket) }
+            catch { if generation == ticket { commandError = error.localizedDescription } }
         }
     }
 
     func detach() {
-        finish(.detached)
+        generation = UUID()
+        reader?.cancel()
+        writer?.cancel()
+        reader = nil
+        writer = nil
+        inputs?.finish()
+        inputs = nil
+        client = nil
+        isChangingTab = false
+        state = .detached
+        access = nil
     }
 
-    func createTab(in directory: String?) {
-        changeTab(Request(type: "newTab", cwd: directory))
+    func createTab() {
+        change { client, ticket in try await self.create(client, ticket: ticket) }
     }
-
     func selectTab(_ id: String) {
         guard id != selectedTab else { return }
-        changeTab(Request(type: "selectTab", tab: id))
+        switchTo(id)
     }
-
     func closeTab(_ id: String) {
-        guard state == .attached, !isChangingTab else { return }
-        closingLastTab = tabs.count == 1 && tabs.first?.id == id
-        changeTab(Request(type: "closeTab", tab: id))
+        change { client, ticket in
+            try await client.command("terminal.close", ["terminal_id": id], write: true)
+            try await self.refresh(client, ticket: ticket)
+            if self.generation == ticket && self.tabs.isEmpty { self.detach(); self.state = .empty }
+        }
     }
-
     func hideTab(_ id: String) {
         let previous = visibleTabs
         guard let index = previous.firstIndex(where: { $0.id == id }) else { return }
@@ -176,18 +210,12 @@ final class RemoteShell: TerminalViewDelegate {
     }
 
     func takeControl() {
-        guard let selectedTab, access?.hasControl == false else { return }
-        changeTab(Request(type: "takeControl", tab: selectedTab))
-    }
-
-    func releaseControl() {
-        guard let selectedTab, access?.hasControl == true else { return }
-        changeTab(Request(type: "releaseControl", tab: selectedTab))
-    }
-
-    func moveViewport(_ direction: ViewportDirection) {
-        guard let selectedTab, access?.hasControl == false else { return }
-        changeTab(Request(type: "pan", tab: selectedTab, direction: direction))
+        guard let id = selectedTab else { return }
+        change { client, ticket in
+            try await client.command("terminal.claim", ["terminal_id": id], write: true)
+            try await self.refresh(client, ticket: ticket)
+            if self.generation == ticket { self.reportSize() }
+        }
     }
 
 #if !os(macOS)
@@ -198,131 +226,32 @@ final class RemoteShell: TerminalViewDelegate {
     }
 #endif
 
-    private func changeTab(_ request: Request) {
-        guard state == .attached, !isChangingTab else { return }
-        isChangingTab = true
-        enqueue(request)
-    }
-
-    private func finish(_ nextState: State) {
-        let connection = socket
-        socket = nil
-        outgoing?.finish()
-        outgoing = nil
-        writer?.cancel()
-        reader?.cancel()
-        writer = nil
-        reader = nil
-        isChangingTab = false
-        closingLastTab = false
-        access = nil
-        connection?.cancel(with: .normalClosure, reason: nil)
-        state = nextState
-    }
-
-    private func connectionFailed(_ connection: URLSessionWebSocketTask, error: Error) {
-        guard socket === connection else { return }
-        finish(.failed(error.localizedDescription))
-    }
-
-    private func receive(_ message: URLSessionWebSocketTask.Message) {
-        switch message {
-        case .data(let data):
-            view.feed(byteArray: Array(data)[...])
-        case .string(let text):
-            guard let event = try? JSONDecoder().decode(Event.self, from: Data(text.utf8)) else { return }
-            switch event.type {
-            case "ready":
-                updateTabs(event.tabs ?? [])
-                selectedTab = event.selectedTab
-                access = event.access
-                state = .attached
-                reportSize()
-            case "tabs":
-                if event.tabs?.isEmpty == true {
-                    finishEmpty()
-                    return
-                }
-                if let nextTabs = event.tabs { updateTabs(nextTabs) }
-                if selectedTab != event.selectedTab { selectedTab = event.selectedTab }
-                if access != event.access { access = event.access }
-                if event.completed == true {
-                    isChangingTab = false
-                    closingLastTab = false
-                }
-            case "control":
-                if event.tab == selectedTab, let updated = event.access { access = updated }
-            case "commandError":
-                isChangingTab = false
-                closingLastTab = false
-                commandError = event.message ?? "无法更新终端标签"
-            case "exit":
-                if closingLastTab && (event.code ?? 0) == 0 { finishEmpty() }
-                else { finish(.ended(event.code ?? 0)) }
-            case "error": finish(.failed(event.message ?? "无法连接远程终端"))
-            default: break
-            }
-        @unknown default: break
-        }
-    }
-
-    private func updateTabs(_ newTabs: [Tab]) {
-        guard newTabs != tabs else { return }
-        tabs = newTabs
-        hiddenTabs.formIntersection(newTabs.map(\.id))
-    }
-
-    private func finishEmpty() {
-        updateTabs([])
-        selectedTab = nil
-        finish(.empty)
-    }
-
-    private func enqueue(_ request: Request) {
-        guard let json = try? JSONEncoder().encode(request) else { return }
-        enqueue(.string(String(decoding: json, as: UTF8.self)))
-    }
-
-    private func enqueue(_ message: URLSessionWebSocketTask.Message) {
-        if case .dropped? = outgoing?.yield(message) {
-            finish(.failed("终端连接拥堵，请重新接入"))
-        }
-    }
-
     private func reportSize() {
-        guard state == .attached else { return }
-        enqueue(Request(type: "resize", cols: dimensions.cols, rows: dimensions.rows))
+        guard let client, let id = selectedTab, canSendInput else { return }
+        let size = dimensions
+        Task {
+            do { try await client.command("terminal.resize", ["terminal_id": id, "cols": size.cols, "rows": size.rows], write: true) }
+            catch { commandError = error.localizedDescription }
+        }
     }
 
     func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {
         guard newCols > 0, newRows > 0 else { return }
-        let size = (cols: min(500, newCols), rows: min(500, newRows))
+        let size = (cols: min(512, newCols), rows: min(256, newRows))
         guard size != dimensions else { return }
         dimensions = size
         reportSize()
     }
 
     func send(source: TerminalView, data: ArraySlice<UInt8>) {
-        guard state == .attached, activeTab != nil, !isChangingTab else { return }
-        if access?.hasControl == false {
-            // Viewing uses SGR wheel reports to move this device's viewport.
-            let report = String(decoding: data.prefix(32), as: UTF8.self)
-            if report.hasPrefix("\u{1B}[<"), report.hasSuffix("M"),
-               let separator = report.firstIndex(of: ";"),
-               let button = Int(report[report.index(report.startIndex, offsetBy: 3)..<separator]) {
-                switch button & ~28 {
-                case 64: moveViewport(.up)
-                case 65: moveViewport(.down)
-                default: break
-                }
-            }
-            return
-        }
-        // Keep large pastes below the server's WebSocket frame limit while preserving byte order.
+        guard canSendInput, !isChangingTab, let id = selectedTab else { return }
         var remaining = data
-        while !remaining.isEmpty, state == .attached {
-            let chunk = remaining.prefix(64 * 1024)
-            enqueue(.data(Data(chunk)))
+        while !remaining.isEmpty {
+            let chunk = remaining.prefix(32768)
+            if case .dropped? = inputs?.yield((id, Data(chunk))) {
+                commandError = "终端输入队列已满，后续内容尚未发送"
+                return
+            }
             remaining = remaining.dropFirst(chunk.count)
         }
     }

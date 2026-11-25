@@ -46,6 +46,16 @@ struct SessionTranscript: View {
     var body: some View {
         VStack(spacing: 0) {
             messages
+#if !os(iOS)
+                .safeAreaBar(edge: .bottom, spacing: 0) {
+                    if permissions.isEmpty {
+                        Color.clear
+                            .frame(height: composerSpacing)
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
+                    }
+                }
+#endif
             if !permissions.isEmpty {
                 TranscriptPermissions(
                     permissions: permissions, horizontalMargin: horizontalMargin, respond: respondToPermission
@@ -62,6 +72,16 @@ struct SessionTranscript: View {
     }
 
     private var messages: some View {
+#if os(macOS)
+        GeometryReader { viewport in
+            messageScrollView(minHeight: viewport.size.height)
+        }
+#else
+        messageScrollView(minHeight: 0)
+#endif
+    }
+
+    private func messageScrollView(minHeight: CGFloat) -> some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 18) {
                 ForEach(timeline.rows) { row in
@@ -78,12 +98,15 @@ struct SessionTranscript: View {
             .padding(.horizontal, horizontalMargin)
             .padding(.top, 20)
             .padding(.bottom, max(8, composerSpacing))
-            .frame(maxWidth: .infinity)
+            // Keep the blank space above a short conversation inside the scroll document.
+            .frame(maxWidth: .infinity, minHeight: minHeight, alignment: .bottom)
         }
         .environment(\.transcriptMarkdownCache, markdownCache)
         .scrollPosition($position)
         .defaultScrollAnchor(.bottom)
-#if os(iOS)
+#if os(macOS)
+        .scrollBounceBehavior(.basedOnSize, axes: .vertical)
+#elseif os(iOS)
         .defaultScrollAnchor(.top, for: .alignment)
 #endif
         .onChange(of: timeline.rows.count) { previousCount, count in
@@ -99,15 +122,6 @@ struct SessionTranscript: View {
         .scrollEdgeEffectStyle(.soft, for: .bottom)
 #if os(iOS)
         .scrollDismissesKeyboard(.interactively)
-#else
-        .safeAreaBar(edge: .bottom, spacing: 0) {
-            if permissions.isEmpty {
-                Color.clear
-                    .frame(height: composerSpacing)
-                    .allowsHitTesting(false)
-                    .accessibilityHidden(true)
-            }
-        }
 #endif
         .overlay {
             if timeline.rows.isEmpty, !isResponding {
@@ -634,7 +648,7 @@ private struct TranscriptPermissionCard: View {
                     ForEach(permission.options) { option in
                         Button(option.name) { respond(option.id) }
                     }
-                    Button("取消请求") { respond(nil) }
+                    Button("停止本轮对话") { respond(nil) }
                 }
             }
             Text(permission.title).font(.callout).textSelection(.enabled)

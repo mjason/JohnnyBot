@@ -12,9 +12,8 @@ nonisolated struct ACPAttachment: Identifiable, Sendable {
         var fileURL: URL?
     }
 
-    static let maxFileBytes = 5 * 1024 * 1024
-    static let maxTotalBytes = 8 * 1024 * 1024
-    static let maxWireBytes = 12 * 1024 * 1024
+    static let maxFileBytes = 92 * 1024
+    static let maxTotalBytes = 92 * 1024
     private static let maxImageSourceBytes = 32 * 1024 * 1024
     private static let resourceScheme = "johnny-attachment"
 
@@ -92,13 +91,17 @@ nonisolated struct ACPAttachment: Identifiable, Sendable {
 
     static func imageAttachment(_ image: CGImage, name: String, original: (data: Data, name: String)? = nil) throws -> Self {
         guard let png = encode(image, type: .png) else { throw AttachmentError.invalidImage }
-        if png.count <= 2 * 1024 * 1024 {
+        if png.count <= maxFileBytes {
             return makeImage(png, mimeType: "image/png", name: name, original: original)
         }
-        guard let jpeg = encode(image, type: .jpeg), jpeg.count <= maxFileBytes else {
-            throw AttachmentError.tooLarge(maxFileBytes)
+        guard let source = CGImageSourceCreateWithData(png as CFData, nil) else { throw AttachmentError.invalidImage }
+        for size in [1440, 1080, 800, 600, 400, 256] {
+            if let scaled = resizedImage(source, maxPixels: size), let jpeg = encode(scaled, type: .jpeg),
+               jpeg.count <= maxFileBytes {
+                return makeImage(jpeg, mimeType: "image/jpeg", name: name, original: original)
+            }
         }
-        return makeImage(jpeg, mimeType: "image/jpeg", name: name, original: original)
+        throw AttachmentError.tooLarge(maxFileBytes)
     }
 
     private static func makeImage(_ data: Data, mimeType: String, name: String, original: (data: Data, name: String)?) -> Self {
@@ -230,7 +233,7 @@ nonisolated enum AttachmentError: LocalizedError {
         case .invalidImage: "无法读取这张图片。"
         case .unsupportedImage: "当前 Agent 不支持图片附件。"
         case .unsupportedFile: "当前 Agent 不支持文件附件。"
-        case .tooLarge(let bytes): "附件超过 \(bytes / (1024 * 1024)) MB。"
+        case .tooLarge(let bytes): "附件超过 \(bytes / 1024) KiB。"
         case .messageTooLarge: "这条消息的附件太大，请移除部分附件后重试。"
         }
     }

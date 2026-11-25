@@ -309,7 +309,7 @@ struct MacSessionList: View {
                 }
             } else {
                 let title = item as? NSObject === section ? "项目" : (item as? NSObject === placeholder ?
-                        (model.connected ? "正在加载项目…" : "连接服务器后显示项目") : "暂无会话")
+                        (model.connected ? "添加项目后在此显示" : "连接服务器后显示项目") : "暂无会话")
                 cell.bind { cell in cell.display(title, secondary: true) }
             }
             return cell

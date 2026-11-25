@@ -171,7 +171,7 @@ struct PhoneSessionList: UIViewControllerRepresentable {
                     }
                 }
             } else {
-                cell.render = { cell in cell.configure(title: "正在加载项目…", accessory: .empty) }
+                cell.render = { cell in cell.configure(title: "添加项目后在此显示", accessory: .empty) }
             }
             return cell
         }

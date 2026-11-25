@@ -48,7 +48,10 @@ struct RemoteDirectoryPicker: View {
         return directories.filter { $0.name.localizedStandardContains(search) }
     }
 
-    private var chosenPath: String? { selection ?? listing?.path }
+    private var chosenPath: String? {
+        guard let path = selection ?? listing?.path, !ACPProject(path: path).isDefaultWorkspaceRoot else { return nil }
+        return path
+    }
     private var homePath: String? { client.projectHomeDirectory(defaultPath: defaultPath) }
 
     var body: some View {
@@ -333,13 +336,7 @@ struct RemoteDirectoryPicker: View {
         let navigation = request.navigation
         let path = navigation == .home ? homePath ?? defaultPath : navigation.path
         do {
-            let result: ACPDirectoryListing
-            do {
-                result = try await client.listDirectories(path: path)
-            } catch let error as ACPFailure where navigation == .home && path != defaultPath && error.code == -32602 {
-                try Task.checkCancellation()
-                result = try await client.listDirectories(path: defaultPath)
-            }
+            let result = try await client.listDirectories(path: path)
             try Task.checkCancellation()
             if let previous = listing?.path, previous != result.path {
                 switch navigation {

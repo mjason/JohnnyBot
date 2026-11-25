@@ -1,30 +1,26 @@
 import Foundation
 import Observation
+import CryptoKit
 
 struct ACPFailure: LocalizedError {
     let message: String
-    let code: Int?
-    private let reason: String?
-
-    init(message: String, code: Int? = nil, reason: String? = nil) {
+    let reason: String?
+    init(message: String, reason: String? = nil) {
         self.message = message
-        self.code = code
         self.reason = reason
     }
-
     var errorDescription: String? { message }
 
-    var isCodexSessionInUse: Bool { reason == "thread_active_writer" }
-
-    var isSessionOccupied: Bool {
-        isCodexSessionInUse
-            || (code == -32010 && message.caseInsensitiveCompare("Session is attached to another client") == .orderedSame)
-    }
 }
 
 struct ACPProject: Hashable, Identifiable {
     let path: String?
     var id: String { path ?? "" }
+
+    var isDefaultWorkspaceRoot: Bool { id == "default" }
+
+    var workspaceID: String { id.split(separator: "/").first.map(String.init) ?? "" }
+    var relativePath: String { id.split(separator: "/", maxSplits: 1).dropFirst().first.map(String.init) ?? "." }
 
     var name: String {
         guard let path else { return "默认项目" }
@@ -114,37 +110,7 @@ struct ACPPermission: Identifiable {
 
 @MainActor @Observable
 final class ACPClient {
-    @ObservationIgnored private var streamUpdates: [(String, [String: Any])] = []
     @ObservationIgnored private var batchOffsets: [String: Set<Int>]?
-    @ObservationIgnored private var streamFlush: Task<Void, Never>?
-    @ObservationIgnored private var peerTurns = Set<String>()
-
-    private func flushStream() {
-        streamFlush?.cancel()
-        streamFlush = nil
-        guard !streamUpdates.isEmpty else { return }
-        batchOffsets = [:]
-        for (session, update) in streamUpdates { apply(update, to: session) }
-        streamUpdates.removeAll(keepingCapacity: true)
-        let changes = batchOffsets ?? [:]
-        batchOffsets = nil
-        for (id, offsets) in changes {
-            if let timeline = timelines[id], let history = entries[id] {
-                timeline.update(history, changedOffsets: offsets)
-            } else if let offset = offsets.first {
-                publishEntry(in: id, at: offset)
-            }
-        }
-    }
-
-    private func enqueueStream(_ update: [String: Any], session: String) {
-        streamUpdates.append((session, update))
-        guard streamFlush == nil else { return }
-        streamFlush = Task {
-            do { try await Task.sleep(for: .milliseconds(120)) } catch { return }
-            flushStream()
-        }
-    }
 
     private struct TranscriptIndex {
         struct Message: Hashable {
@@ -156,38 +122,34 @@ final class ACPClient {
         var tools: [String: Int] = [:]
     }
 
-#if os(iOS)
-    static let defaultAddress = ProcessInfo.processInfo.environment["JOHNNY_ACP_URL"] ?? ""
-#else
-    static let defaultAddress = ProcessInfo.processInfo.environment["JOHNNY_ACP_URL"] ?? "ws://127.0.0.1:8765/acp"
-#endif
-
+    static let defaultAddress = ProcessInfo.processInfo.environment["JOHNNY_MQTT_URL"] ?? ""
     var address: String
-    var token: String
-
+    var fingerprint: String
+    init(address: String, fingerprint: String = "") {
+        self.address = address
+        self.fingerprint = fingerprint
+    }
     var displayName: String {
         let components = URLComponents(string: address)
         guard let host = components?.host else { return address.isEmpty ? "新服务器" : address }
         return components?.port.map { "\(host):\($0)" } ?? host
     }
 
-    init(address: String, token: String) {
-        self.address = address
-        self.token = token
-    }
     private(set) var status = "未连接"
     private(set) var connected = false
-    private(set) var supportsSessionLoad = false
-    private(set) var supportsSessionList = false
-    private var supportsProjectFilePreview = false
-    private(set) var supportsDirectoryListing = false
-    private var serverHomeDirectory: String?
-    private(set) var supportsRemoteShell = false
-    private(set) var supportsSessionRename = false
-    private(set) var supportsSessionDelete = false
-    private(set) var supportsPromptImages = false
-    private(set) var supportsPromptFiles = false
-    private var supportsSessionClose = false
+    var available: Bool { connected || offline }
+    private(set) var offline = false
+    var supportsSessionLoad: Bool { available }
+    var supportsSessionList: Bool { available }
+    var supportsDirectoryListing: Bool { connected }
+    private var capabilities: [String: Bool] = [:]
+    var supportsRemoteShell: Bool { connected && capabilities["terminal"] == true }
+    var supportsConfig: Bool { connected && capabilities["thread_config"] == true }
+    var supportsMode: Bool { connected && capabilities["thread_mode"] == true }
+    var supportsSessionRename: Bool { connected }
+    func canDelete(_ id: String) -> Bool { connected && capabilities["thread_delete"] == true && deletionSupport[id] != false }
+    var supportsPromptImages: Bool { available }
+    var supportsPromptFiles: Bool { available }
     let directory = SessionDirectory()
     private(set) var sessionOptions: [String: ACPSessionOptions] = [:]
     private(set) var loaded: Set<String> = []
@@ -211,686 +173,580 @@ final class ACPClient {
     }
     private(set) var permissions: [ACPPermission] = []
 
-    @ObservationIgnored private var socket: URLSessionWebSocketTask?
-    @ObservationIgnored private var pending: [Int: CheckedContinuation<[String: Any], Error>] = [:]
-    @ObservationIgnored private var nextID = 0
-    @ObservationIgnored private var listingProjects: [ACPProject: (titlesOnly: Bool, task: Task<Void, Error>)] = [:]
-    @ObservationIgnored private var directoryRevision = 0
-    // A page that was already in flight must not bring back a deleted session.
-    @ObservationIgnored private var deletedDuringListing: [String: Int] = [:]
-    @ObservationIgnored private var titleUpdates: [String: (title: String, revision: Int)] = [:]
-    @ObservationIgnored private var replayHistory: [String: [ACPEntry]] = [:]
+    @ObservationIgnored private var broker: GoBroker?
+    @ObservationIgnored private var replica: GoReplica?
+    @ObservationIgnored private var identity: DeviceIdentity?
+    @ObservationIgnored private var replicaName = ""
     @ObservationIgnored private var transcriptIndexes: [String: TranscriptIndex] = [:]
-    private let replyTimingStore = ACPReplyTimingStore()
+    @ObservationIgnored private var threads: [String: [String: Any]] = [:]
+    @ObservationIgnored private var projects = Set<ACPProject>()
+    @ObservationIgnored private var hydrated = Set<String>()
+    @ObservationIgnored private var subscriptions = Set<String>()
+    @ObservationIgnored private var pulling: [String: Task<Void, Error>] = [:]
+    @ObservationIgnored private var dirty = Set<String>()
+    @ObservationIgnored private var sendStarted: [String: ContinuousClock.Instant] = [:]
+    private let timingStore = ACPReplyTimingStore()
+    @ObservationIgnored private var timings: [String: [String: ACPReplyTiming]] = [:]
+    @ObservationIgnored private var turns: [String: String] = [:]
+    @ObservationIgnored private var poll: Task<Void, Never>?
+    @ObservationIgnored private var epoch = ""
+    private(set) var workspaceIDs: [String] = []
+    private(set) var agents = ["codex"]
+    private(set) var showingArchives = false
+    struct QueuedPrompt: Identifiable { let id: String; let text: String }
+    private(set) var queuedPrompts: [String: [QueuedPrompt]] = [:]
+    @ObservationIgnored private var activeCommands = Set<String>()
+    private var deletionSupport: [String: Bool] = [:]
+    var deviceID: String { identity?.id ?? "" }
 
-    func importToken(from url: URL) throws {
-        let accessed = url.startAccessingSecurityScopedResource()
-        defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-        let contents = try String(contentsOf: url, encoding: .utf8)
-        for line in contents.split(whereSeparator: \.isNewline) {
-            let parts = line.split(separator: "=", maxSplits: 1)
-            guard parts.count == 2, parts[0].trimmingCharacters(in: .whitespaces) == "TOKEN" else { continue }
-            let value = parts[1].trimmingCharacters(in: .whitespaces)
-            if !value.isEmpty {
-                if let quote = value.first, (quote == "\"" || quote == "'"), value.last == quote, value.count > 1 {
-                    token = String(value.dropFirst().dropLast())
-                } else {
-                    token = value
-                }
-                return
-            }
+    func devicePublicKey() throws -> String { try deviceIdentity().publicLine }
+
+    private func deviceIdentity() throws -> DeviceIdentity {
+        if let identity { return identity }
+        let key: Curve25519.Signing.PrivateKey
+        if let stored = try ServerCredentialStore.deviceKey() {
+            key = try .init(rawRepresentation: stored)
+        } else {
+            key = try .init(rawRepresentation: ServerCredentialStore.installDeviceKey(Curve25519.Signing.PrivateKey().rawRepresentation))
         }
-        throw ACPFailure(message: "配置文件缺少 TOKEN")
+        let result = DeviceIdentity(key: key)
+        identity = result
+        return result
     }
 
-    func connect() async throws {
-        guard socket == nil else { return }
-        guard let url = URL(string: address), let scheme = url.scheme, ["ws", "wss"].contains(scheme), url.host != nil else {
-            throw ACPFailure(message: "请输入有效的 WebSocket 地址")
+    private func prepareReplica(identity: DeviceIdentity, directory: URL?) throws {
+        let name = [address, fingerprint.lowercased(), identity.id].joined(separator: "\n")
+        if replicaName != name {
+            clearMemory()
+            replica = try GoReplica(name: name, directory: directory)
+            replicaName = name
         }
-        let request = try authorizedRequest(to: url)
-        let task = URLSession.shared.webSocketTask(with: request)
-        task.maximumMessageSize = 16 * 1024 * 1024
-        socket = task
-        status = "正在连接…"
-        task.resume()
-        Task { await receive(from: task) }
+        epoch = UserDefaults.standard.string(forKey: "goEpoch." + name) ?? ""
+        workspaceIDs = UserDefaults.standard.stringArray(forKey: "goWorkspaces." + name) ?? []
+        try restoreQueue()
+        offline = !workspaceIDs.isEmpty && !epoch.isEmpty
+    }
+
+    func restoreCache() throws {
+        guard !fingerprint.isEmpty else { return }
+        try prepareReplica(identity: deviceIdentity(), directory: nil)
+    }
+
+    func connect(testIdentity: DeviceIdentity? = nil, cacheDirectory: URL? = nil) async throws {
+        if broker != nil { disconnect(reason: URLError(.cancelled)) }
+        let device = try testIdentity ?? deviceIdentity()
+        identity = device
+        let transport = try GoBroker(address: address, fingerprint: fingerprint, identity: device)
+        try prepareReplica(identity: device, directory: cacheDirectory)
+        broker = transport
+        status = "正在连接 MQTT…"
+        transport.onClose = { [weak self, weak transport] error in
+            guard let self, self.broker === transport else { return }
+            self.disconnect(reason: error)
+        }
+        transport.onHint = { [weak self] scope in self?.hint(scope) }
         do {
-            let info = try await call("initialize", [
-                "protocolVersion": 1,
-                "clientCapabilities": ["session": ["configOptions": ["boolean": [:]]]]
-            ])
-            guard info["protocolVersion"] as? Int == 1 else {
-                throw ACPFailure(message: "服务器未协商 ACP v1")
+            try await transport.start()
+            let info = try await command("workspaces.list")
+            guard let newEpoch = info["epoch"] as? String, !newEpoch.isEmpty,
+                  let ids = info["workspaces"] as? [String], !ids.isEmpty else { throw ACPFailure(message: "服务器没有配置工作区") }
+            if epoch != newEpoch {
+                clearMemory()
             }
-            let capabilities = info["agentCapabilities"] as? [String: Any]
-            let sessionCapabilities = capabilities?["sessionCapabilities"] as? [String: Any]
-            let promptCapabilities = capabilities?["promptCapabilities"] as? [String: Any]
-            let metadata = capabilities?["_meta"] as? [String: Any]
-            supportsRemoteShell = metadata?["johnny/shell"] as? Bool == true
-            supportsPromptImages = promptCapabilities?["image"] as? Bool == true
-            supportsPromptFiles = promptCapabilities?["embeddedContext"] as? Bool == true
-            supportsSessionLoad = capabilities?["loadSession"] as? Bool == true
-            supportsProjectFilePreview = metadata?["johnny/read_project_file"] as? Bool == true
-            supportsDirectoryListing = (metadata?["johnny/list_directories"] as? Bool) == true
-            if let home = metadata?["johnny/home_directory"] as? String, home.hasPrefix("/") {
-                serverHomeDirectory = home
-            }
-            supportsSessionList = sessionCapabilities?["list"] is [String: Any]
-            supportsSessionRename = sessionCapabilities?["title"] is [String: Any]
-                || sessionCapabilities?["setTitle"] is [String: Any]
-            supportsSessionDelete = sessionCapabilities?["delete"] is [String: Any]
-            supportsSessionClose = sessionCapabilities?["close"] is [String: Any]
+            epoch = newEpoch
+            workspaceIDs = ids
+            agents = info["agents"] as? [String] ?? ["codex"]
+            capabilities = info["capabilities"] as? [String: Bool] ?? [:]
+            UserDefaults.standard.set(epoch, forKey: "goEpoch." + replicaName)
+            UserDefaults.standard.set(ids, forKey: "goWorkspaces." + replicaName)
             connected = true
-            let agentInfo = info["agentInfo"] as? [String: Any]
-            status = agentInfo?["title"] as? String ?? "已连接"
+            offline = false
+            status = displayName
+            for scope in hydrated { hint(scope) }
+            poll = Task { [weak self] in
+                while !Task.isCancelled {
+                    do { try await Task.sleep(for: .seconds(8)) } catch { return }
+                    self?.catchUp()
+                }
+            }
+            try restoreQueue()
+            resumeOutbox()
         } catch {
-            if socket === task { disconnect(reason: error) }
+            if broker === transport { disconnect(reason: error) }
             throw error
         }
     }
 
-    func shellRequest() throws -> URLRequest {
-        guard connected, supportsRemoteShell, let endpoint = socket?.originalRequest?.url,
-              var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
-            throw ACPFailure(message: "当前服务器没有提供远程终端")
-        }
-        components.path = endpoint.deletingLastPathComponent().appending(path: "shell").path
-        components.query = nil
-        components.fragment = nil
-        guard let url = components.url else { throw ACPFailure(message: "无法解析终端地址") }
-        return try authorizedRequest(to: url)
-    }
-
-    private func authorizedRequest(to url: URL) throws -> URLRequest {
-        let credential = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !credential.isEmpty, !credential.contains(where: \.isNewline) else {
-            throw ACPFailure(message: "请输入有效的令牌")
-        }
-        var request = URLRequest(url: url, timeoutInterval: 15)
-        request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization")
-        return request
-    }
-
     func disconnect(reason: Error? = nil) {
-        streamFlush?.cancel()
-        streamFlush = nil
-        streamUpdates.removeAll()
-        peerTurns.removeAll()
-        socket?.cancel(with: .goingAway, reason: nil)
-        socket = nil
+        let old = broker
+        broker = nil
+        old?.close()
+        poll?.cancel()
+        poll = nil
+        for task in pulling.values { task.cancel() }
+        pulling.removeAll()
+        subscriptions.removeAll()
+        dirty.removeAll()
         connected = false
-        supportsSessionLoad = false
-        supportsSessionList = false
-        supportsProjectFilePreview = false
-        supportsDirectoryListing = false
-        serverHomeDirectory = nil
-        supportsRemoteShell = false
-        supportsSessionRename = false
-        supportsSessionDelete = false
-        supportsPromptImages = false
-        supportsPromptFiles = false
-        supportsSessionClose = false
-        status = reason.map { "连接中断 · \($0.localizedDescription)" } ?? "未连接"
-        let requests = pending
-        pending.removeAll()
-        for continuation in requests.values {
-            continuation.resume(throwing: reason ?? ACPFailure(message: "连接已断开"))
-        }
-        sessionOptions.removeAll()
-        loaded.removeAll()
-        prompting.removeAll()
-        permissions.removeAll()
-        directory.removeAll()
-        listingProjects.removeAll()
-        deletedDuringListing.removeAll()
-        titleUpdates.removeAll()
+        offline = reason != nil && !workspaceIDs.isEmpty
+        status = offline ? "离线 · " + displayName : "未连接"
+    }
+
+    private func clearMemory() {
+        threads.removeAll()
+        projects.removeAll()
+        hydrated.removeAll()
         entries.removeAll()
         timelines.removeAll()
-        replayHistory.removeAll()
         transcriptIndexes.removeAll()
+        loaded.removeAll()
+        prompting.removeAll()
+        turns.removeAll()
+        sendStarted.removeAll()
+        timings.removeAll()
+        permissions.removeAll()
+        sessionOptions.removeAll()
+        observedCommands.removeAll()
+        queuedPrompts.removeAll()
+        deletionSupport.removeAll()
+        directory.removeAll()
     }
 
-    func projectHomeDirectory(defaultPath: String?) -> String? {
-        if let serverHomeDirectory { return serverHomeDirectory }
-        guard let defaultPath, defaultPath.hasPrefix("/") else { return nil }
-        // Older servers only report the configured project. Recognize standard account directories.
-        let components = defaultPath.split(separator: "/", maxSplits: 2)
-        switch components.first {
-        case "home", "Users":
-            guard components.count >= 2 else { return nil }
-            return "/\(components[0])/\(components[1])"
-        case "root":
-            return "/root"
-        default:
-            return nil
+    private func checked(_ reply: [String: Any]) throws -> [String: Any] {
+        guard reply["ok"] as? Bool == true else {
+            let fault = reply["error"] as? [String: Any]
+            throw ACPFailure(message: fault?["message"] as? String ?? "服务端命令失败", reason: fault?["code"] as? String)
         }
+        return reply["result"] as? [String: Any] ?? [:]
     }
 
-    func readProjectFile(_ path: String, session: String) async throws -> String {
-        guard supportsProjectFilePreview else { throw ACPFailure(message: "请更新服务器以启用项目文件预览") }
-        let result = try await call("_johnny/read_project_file", ["sessionId": session, "path": path])
-        guard let content = result["content"] as? String else { throw ACPFailure(message: "服务器返回的文件内容无效") }
-        return content
+    @discardableResult
+    func command(_ op: String, _ fields: [String: Any] = [:], write: Bool = false, durable: Bool = false) async throws -> [String: Any] {
+        let id = UUID().uuidString.lowercased()
+        var message = fields
+        message["cmd_id"] = id
+        message["op"] = op
+        if write { message["epoch"] = epoch }
+        let payload = try JSONSerialization.data(withJSONObject: message)
+        guard payload.count <= 128 * 1024 else { throw ACPFailure(message: "消息和附件合计超过服务端 128 KiB 上限") }
+        let cache = replica
+        if durable {
+            guard !epoch.isEmpty, let cache else { throw ACPFailure(message: "请先配对服务器") }
+            if broker == nil && op != "prompt.send" { throw URLError(.notConnectedToInternet) }
+            try cache.queue(id: id, epoch: epoch, payload: payload)
+            if op == "prompt.send" { try restoreQueue() }
+        }
+        guard let broker else {
+            if durable && op == "prompt.send" { return ["queued": true] }
+            throw URLError(.notConnectedToInternet)
+        }
+        activeCommands.insert(id)
+        defer { activeCommands.remove(id) }
+        let reply: [String: Any]
+        do {
+            reply = try await broker.request(id: id, payload: payload, timeout: op == "prompt.send" ? .seconds(86400) : .seconds(60))
+        } catch {
+            if durable && op == "prompt.send" { return ["queued": true] }
+            throw error
+        }
+        if durable {
+            try cache?.complete(id: id, reply: reply)
+            if op == "prompt.send" { try restoreQueue() }
+        }
+        return try checked(reply)
     }
 
-    func listDirectories(path: String? = nil) async throws -> ACPDirectoryListing {
-        guard supportsDirectoryListing else {
-            throw ACPFailure(message: "服务器未提供远程目录浏览")
+    @ObservationIgnored private var observedCommands = Set<String>()
+
+    private func restoreQueue() throws {
+        var queued: [String: [QueuedPrompt]] = [:]
+        for item in try replica?.pending(epoch: epoch) ?? [] {
+            guard !observedCommands.contains(item.id),
+                  let message = try JSONSerialization.jsonObject(with: item.payload) as? [String: Any],
+                  message["op"] as? String == "prompt.send", let thread = message["thread_id"] as? String,
+                  let blocks = message["prompt"] as? [[String: Any]] else { continue }
+            let text = blocks.compactMap { $0["text"] as? String }.joined()
+            queued[thread, default: []].append(.init(id: item.id, text: text.isEmpty ? "附件" : text))
         }
-        let result = try await call("_johnny/list_directories", path.map { ["path": $0] } ?? [:])
-        guard let listing = decodeACP(ACPDirectoryListing.self, from: result),
-              listing.path.hasPrefix("/"),
-              listing.parent?.hasPrefix("/") != false,
-              listing.directories.allSatisfy({ $0.path.hasPrefix("/") }) else {
-            throw ACPFailure(message: "服务器返回的目录列表格式无效")
-        }
-        return listing
+        queuedPrompts = queued
     }
 
-    func listSessions(in project: ACPProject, titlesOnly: Bool = false) async throws {
-        guard supportsSessionList else { return }
-        guard let connection = socket else { throw ACPFailure(message: "请先连接服务器") }
-        while let listing = listingProjects[project] {
-            try await listing.task.value
-            guard socket === connection else { throw ACPFailure(message: "连接已断开") }
-            if titlesOnly || !listing.titlesOnly { return }
-        }
-        let task = Task {
-            defer {
-                if socket === connection {
-                    listingProjects.removeValue(forKey: project)
-                    if listingProjects.isEmpty { deletedDuringListing.removeAll() }
+    private func resumeOutbox() {
+        guard connected, let cache = replica, let broker, let pending = try? cache.pending(epoch: epoch) else { return }
+        var chains: [String: Task<Void, Never>] = [:]
+        for item in pending where !activeCommands.contains(item.id) {
+            guard let msg = try? JSONSerialization.jsonObject(with: item.payload) as? [String: Any] else { continue }
+            activeCommands.insert(item.id)
+            let scope = msg["thread_id"] as? String ?? item.id
+            let previous = chains[scope]
+            chains[scope] = Task { [weak self] in
+                defer { self?.activeCommands.remove(item.id) }
+                await previous?.value
+                guard let self, self.broker === broker else { return }
+                do {
+                    let reply = try await broker.request(id: item.id, payload: item.payload, timeout: .seconds(86400))
+                    try cache.complete(id: item.id, reply: reply)
+                    try restoreQueue()
+                    _ = try checked(reply)
+                } catch {
+                    if self.broker === broker { self.notice(error.localizedDescription, in: scope) }
                 }
             }
-            try await fetchSessions(in: project, titlesOnly: titlesOnly, connection: connection)
         }
-        listingProjects[project] = (titlesOnly, task)
+    }
+
+    func catchUp() {
+        for scope in hydrated { hint(scope) }
+        resumeOutbox()
+    }
+
+    private func hint(_ scope: String) {
+        guard connected, hydrated.contains(scope) else { return }
+        if pulling[scope] != nil { dirty.insert(scope); return }
+        Task { do { try await sync(scope) } catch { if connected { status = error.localizedDescription } } }
+    }
+
+    private func sync(_ scope: String) async throws {
+        guard let cache = replica else { throw ACPFailure(message: "会话缓存尚未打开") }
+        let cursor = try cache.cursor(scope)
+        if !cursor.epoch.isEmpty, cursor.epoch != epoch { try cache.clear(scope); resetProjection(scope) }
+        if !hydrated.contains(scope) {
+            let history = try cache.history(scope)
+            hydrated.insert(scope)
+            applyEvents(history, scope: scope, replay: true)
+        }
+        guard connected, let transport = broker else { return }
+        if let task = pulling[scope] { return try await task.value }
+        let task = Task {
+            defer { if broker === transport { pulling.removeValue(forKey: scope) } }
+            if !subscriptions.contains(scope) {
+                try await transport.subscribe("ev/" + scope)
+                subscriptions.insert(scope)
+            }
+            repeat {
+                dirty.remove(scope)
+                while true {
+                    try Task.checkCancellation()
+                    let position = try cache.cursor(scope)
+                    var args: [String: Any] = ["scope": scope, "after": position.after, "limit": 100]
+                    if !position.epoch.isEmpty { args["epoch"] = position.epoch }
+                    if position.through != 0 { args["through"] = position.through }
+                    let page: [String: Any]
+                    do { page = try await command("sync.pull", args) }
+                    catch let error as ACPFailure where error.reason == "not_found" && scope.hasPrefix("thread/") {
+                        guard broker === transport else { throw CancellationError() }
+                        purge(String(scope.dropFirst(7)))
+                        throw error
+                    }
+                    try Task.checkCancellation()
+                    guard broker === transport, hydrated.contains(scope) else { throw CancellationError() }
+                    if page["reset"] as? Bool == true {
+                        guard page["epoch"] as? String == epoch else {
+                            let error = ACPFailure(message: "服务端数据库已更换，正在重新连接")
+                            disconnect(reason: error)
+                            throw error
+                        }
+                        try cache.clear(scope)
+                        resetProjection(scope)
+                        continue
+                    }
+                    let events = try cache.apply(page, scope: scope, expected: position, epoch: epoch)
+                    applyEvents(events, scope: scope, replay: false)
+                    if page["more"] as? Bool != true { break }
+                }
+            } while dirty.contains(scope)
+        }
+        pulling[scope] = task
         try await task.value
     }
 
-    private func fetchSessions(in project: ACPProject, titlesOnly: Bool, connection: URLSessionWebSocketTask) async throws {
-        guard socket === connection else { throw ACPFailure(message: "连接已断开") }
-        let startingRevision = directoryRevision
-        var listed: [ListedSession] = []
-        var listedIDs: Set<String> = []
-        var cursor: String?
-        var seenCursors: Set<String> = []
-        repeat {
-            var params: [String: Any] = [:]
-            params["cwd"] = project.path
-            params["cursor"] = cursor
-            let result = try await call("session/list", params)
-            guard socket === connection else { throw ACPFailure(message: "连接已断开") }
-            for item in result["sessions"] as? [[String: Any]] ?? [] {
-                let cwd = item["cwd"] as? String ?? project.path ?? ""
-                guard project.path == nil || project.path == cwd,
-                      let id = item["sessionId"] as? String,
-                      deletedDuringListing[id, default: 0] <= startingRevision,
-                      listedIDs.insert(id).inserted else { continue }
-                let listedTitle: String
-                if let update = titleUpdates[id], update.revision > startingRevision {
-                    listedTitle = update.title
-                } else {
-                    listedTitle = item["title"] as? String ?? titleUpdates[id]?.title ?? "未命名会话"
-                }
-                listed.append(ListedSession(id: id, title: listedTitle, cwd: cwd))
-            }
-            let firstPage = cursor == nil
-            cursor = result["nextCursor"] as? String
-            if firstPage, !titlesOnly, cursor?.isEmpty == false, !directory.hasListed(project) {
-                directory.replace(listed, ids: listedIDs, in: project, retaining: loaded, complete: false)
-            }
-            if let cursor, !cursor.isEmpty, !seenCursors.insert(cursor).inserted {
-                throw ACPFailure(message: "服务器返回重复的分页游标")
-            }
-        } while cursor?.isEmpty == false
-
-        if !deletedDuringListing.isEmpty {
-            listed.removeAll { deletedDuringListing[$0.id, default: 0] > startingRevision }
-            listedIDs = Set(listed.map(\.id))
-        }
-        for index in listed.indices {
-            if let update = titleUpdates[listed[index].id], update.revision > startingRevision {
-                listed[index].title = update.title
-            }
-        }
-        if titlesOnly {
-            for item in listed { directory.updateTitle(item.title, for: item.id) }
+    private func resetProjection(_ scope: String) {
+        if scope.hasPrefix("threads/") {
+            let workspace = String(scope.dropFirst(8))
+            threads = threads.filter { $0.value["workspace_id"] as? String != workspace }
+            rebuildLists(workspace)
         } else {
-            directory.replace(listed, ids: listedIDs, in: project, retaining: loaded, complete: true)
+            let id = String(scope.dropFirst(7))
+            entries[id] = []
+            transcriptIndexes[id] = nil
+            timelines[id]?.replace([])
+            turns[id] = nil
+            prompting.remove(id)
+            permissions.removeAll { $0.sessionID == id }
+            sessionOptions[id] = nil
+            deletionSupport[id] = nil
         }
     }
 
-    func createSession(in project: ACPProject) async throws -> String {
-        guard let socket else { throw ACPFailure(message: "请先连接服务器") }
-        var params: [String: Any] = ["mcpServers": []]
-        params["cwd"] = project.path
-        let result = try await call("session/new", params)
-        guard self.socket === socket else { throw ACPFailure(message: "连接已断开") }
-        guard let id = result["sessionId"] as? String else {
-            throw ACPFailure(message: "服务器未返回会话 ID")
+    private func applyEvents(_ events: [GoReplica.Event], scope: String, replay: Bool) {
+        if scope.hasPrefix("threads/") {
+            for event in events {
+                guard let id = event.data["thread_id"] as? String else { continue }
+                if event.kind == "thread.upsert" { threads[id] = event.data }
+                if event.kind == "thread.deleted" { purge(id) }
+            }
+            if replay || !events.isEmpty { rebuildLists(String(scope.dropFirst(8))) }
+            return
         }
-        let cwd = result["cwd"] as? String ?? project.path ?? ""
-        let title = titleUpdates[id]?.title ?? result["title"] as? String ?? "新会话"
-        directory.insert(ACPSession(id: id, title: title, cwd: cwd), in: project, atFront: true)
-        applySessionSetup(result, to: id)
+        let id = String(scope.dropFirst(7))
         if timelines[id] == nil { timelines[id] = TranscriptTimeline() }
+        if timings[id] == nil, let url = URL(string: address) {
+            timings[id] = timingStore.timings(endpoint: url, sessionID: id)
+        }
+        guard !events.isEmpty else { return }
+        batchOffsets = [:]
+        for event in events {
+            let data = event.data
+            switch event.kind {
+            case "session.setup":
+                applySessionSetup(data, to: id)
+                if let allowed = data["canDelete"] as? Bool { deletionSupport[id] = allowed }
+            case "session.config": apply(["sessionUpdate": "config_option_update", "configOptions": data["configOptions"] ?? []], to: id)
+            case "session.mode":
+                if let mode = data["currentModeId"] as? String { sessionOptions[id, default: .init()].currentModeID = mode }
+            case "turn.started":
+                if data["device_id"] as? String == deviceID, let cmd = data["cmd_id"] as? String {
+                    observedCommands.insert(cmd)
+                    queuedPrompts[id]?.removeAll { $0.id == cmd }
+                }
+                turns[id] = data["turn_id"] as? String
+                prompting.insert(id)
+            case "message.user":
+                let blocks = data["prompt"] as? [[String: Any]] ?? []
+                let entry = ACPEntry(kind: .user, text: blocks.compactMap { $0["text"] as? String }.joined(),
+                                     attachments: blocks.compactMap(ACPAttachment.replayPreview))
+                updateTranscript(id) { history, _ in history.append(entry); return history.count - 1 }
+            case "acp.history", "acp.update":
+                let notification = data["notification"] as? [String: Any] ?? data
+                if let update = notification["update"] as? [String: Any],
+                   event.kind == "acp.history" || update["sessionUpdate"] as? String != "user_message_chunk" { apply(update, to: id) }
+            case "permission.requested":
+                guard let permission = data["permission_id"] as? String, let request = data["request"] as? [String: Any] else { continue }
+                let tool = request["toolCall"] as? [String: Any]
+                let options = (request["options"] as? [[String: Any]] ?? []).compactMap { item -> ACPPermission.Option? in
+                    guard let option = item["optionId"] as? String, let name = item["name"] as? String else { return nil }
+                    return .init(id: option, name: name)
+                }
+                permissions.append(.init(requestID: permission, sessionID: id, title: tool?["title"] as? String ?? "工具调用",
+                                         details: tool?["rawInput"].map { String(describing: $0) }, options: options))
+            case "permission.resolved":
+                let key = data["permission_id"] as? String
+                permissions.removeAll { $0.sessionID == id && $0.requestID as? String == key }
+            case "turn.finished":
+                if let turn = data["turn_id"] as? String, let url = URL(string: address) {
+                    if !replay, let start = sendStarted.removeValue(forKey: id) {
+                        let value = ACPReplyTiming(elapsed: start.duration(to: .now), wasStopped: data["status"] as? String == "cancelled")
+                        timings[id, default: [:]][turn] = value
+                        timingStore.record(value, for: turn, endpoint: url, sessionID: id)
+                    }
+                    if let timing = timings[id]?[turn], let last = entries[id]?.indices.last {
+                        entries[id]?[last].replyTiming = timing
+                        publishEntry(in: id, at: last)
+                    }
+                }
+                if turns[id] == data["turn_id"] as? String {
+                    turns[id] = nil
+                    prompting.remove(id)
+                    permissions.removeAll { $0.sessionID == id }
+                }
+                if let status = data["status"] as? String, status != "finished" { notice(status, in: id) }
+            default: break
+            }
+        }
+        let offsets = batchOffsets?[id] ?? []
+        batchOffsets = nil
+        if !offsets.isEmpty { timelines[id]?.update(entries[id] ?? [], changedOffsets: offsets) }
+    }
+
+    private func notice(_ text: String, in id: String) {
+        updateTranscript(id) { rows, _ in rows.append(ACPEntry(kind: .status, text: text)); return rows.count - 1 }
+    }
+
+    private func purge(_ id: String) {
+        threads.removeValue(forKey: id)
+        directory.remove(id)
+        loaded.remove(id)
+        if let url = URL(string: address) { timingStore.remove(endpoint: url, sessionID: id) }
+        timings[id] = nil
+        sendStarted[id] = nil
+        let scope = "thread/" + id
+        pulling[scope]?.cancel()
+        hydrated.remove(scope)
+        resetProjection(scope)
+        try? replica?.clear(scope)
+    }
+
+    private func rebuildLists(_ workspace: String) {
+        let sorted = threads.values.filter { $0["workspace_id"] as? String == workspace && (showingArchives || $0["archived"] as? Bool != true) }
+            .sorted { ($0["updated_at"] as? String ?? "") > ($1["updated_at"] as? String ?? "") }
+        for project in projects where project.workspaceID == workspace {
+            let rows = sorted.compactMap { item -> ListedSession? in
+                guard let id = item["thread_id"] as? String, let path = item["path"] as? String,
+                      project.relativePath == "." || project.relativePath == path else { return nil }
+                let title = item["title"] as? String ?? ""
+                return ListedSession(id: id, title: title.isEmpty ? "新会话" : title, cwd: path)
+            }
+            directory.replace(rows, ids: Set(rows.map(\.id)), in: project, retaining: [], complete: true)
+        }
+    }
+
+    func projectHomeDirectory(defaultPath: String?) -> String? { defaultPath ?? workspaceIDs.first }
+
+    func listDirectories(path: String? = nil) async throws -> ACPDirectoryListing {
+        let project = ACPProject(path: path ?? workspaceIDs.first)
+        var dirs: [ACPDirectoryListing.Directory] = []
+        var after = ""
+        repeat {
+            let page = try await command("directories.list", ["workspace_id": project.workspaceID, "path": project.relativePath, "name_after": after])
+            let names = page["directories"] as? [String] ?? []
+            dirs += names.map { .init(name: $0, path: project.id + "/" + $0) }
+            guard page["more"] as? Bool == true else { break }
+            guard let last = names.last, last != after else { throw ACPFailure(message: "目录分页无效") }
+            after = last
+        } while true
+        return .init(path: project.id, parent: project.relativePath == "." ? nil : String(project.id.split(separator: "/").dropLast().joined(separator: "/")), directories: dirs)
+    }
+
+    func readProjectFile(_ path: String, session: String) async throws -> String {
+        for attempt in 0...1 {
+            var bytes = Data()
+            var version = ""
+            do {
+                while true {
+                    let page = try await command("file.read", ["thread_id": session, "path": path, "offset": bytes.count, "version": version])
+                    guard let encoded = page["bytes"] as? String, let part = Data(base64Encoded: encoded),
+                          let v = page["version"] as? String, version.isEmpty || version == v,
+                          page["next_offset"] as? Int == bytes.count + part.count else { throw ACPFailure(message: "文件分块无效") }
+                    bytes.append(part)
+                    version = v
+                    if page["more"] as? Bool != true { return String(decoding: bytes, as: UTF8.self) }
+                    guard !part.isEmpty else { throw ACPFailure(message: "文件分块为空") }
+                }
+            } catch let error as ACPFailure where error.reason == "file_changed" && attempt == 0 { continue }
+        }
+        throw ACPFailure(message: "读取期间文件已变更")
+    }
+
+    func listSessions(in project: ACPProject) async throws {
+        let inserted = projects.insert(project).inserted
+        try await sync("threads/" + project.workspaceID)
+        if inserted { rebuildLists(project.workspaceID) }
+    }
+
+    func refreshSessions(in project: ACPProject, agent: String = "codex") async throws {
+        try await command("thread.refresh", ["workspace_id": project.workspaceID, "agent": agent], write: true, durable: true)
+        try await listSessions(in: project)
+    }
+
+    func createSession(in project: ACPProject, agent: String = "codex") async throws -> String {
+        let row = try await command("thread.create", ["workspace_id": project.workspaceID, "path": project.relativePath, "agent": agent], write: true, durable: true)
+        guard let id = row["thread_id"] as? String else { throw ACPFailure(message: "服务器未返回会话 ID") }
+        try await listSessions(in: project)
+        try await sync("thread/" + id)
         loaded.insert(id)
         return id
     }
 
     func load(_ session: ACPSession) async throws {
-        let id = session.id
-        guard !loaded.contains(id), replayHistory[id] == nil else { return }
-        guard let socket else { throw ACPFailure(message: "请先连接服务器") }
-        replayHistory[id] = []
-        transcriptIndexes.removeValue(forKey: id)
-        do {
-            var params: [String: Any] = ["sessionId": id, "mcpServers": []]
-            if !session.cwd.isEmpty { params["cwd"] = session.cwd }
-            let result = try await call("session/load", params)
-            guard self.socket === socket else { throw ACPFailure(message: "连接已断开") }
-            var history = replayHistory.removeValue(forKey: id) ?? []
-            if let endpoint = socket.originalRequest?.url {
-                let timings = replyTimingStore.timings(endpoint: endpoint, sessionID: id)
-                for index in history.indices {
-                    if let key = history[index].replyTimingID, let timing = timings[key] {
-                        history[index].replyTiming = timing
-                    }
-                }
+        let scope = "thread/" + session.id
+        if connected {
+            do { try await command("thread.open", ["thread_id": session.id], write: true) }
+            catch let error as ACPFailure where error.reason == "thread_busy" {
+                // An active turn can already be followed via its durable event stream.
             }
-            let timeline = TranscriptTimeline()
-            timeline.replace(history)
-            timelines[id] = timeline
-            entries[id] = history
-            applySessionSetup(result, to: id)
-            loaded.insert(id)
-        } catch {
-            if self.socket === socket {
-                replayHistory.removeValue(forKey: id)
-                transcriptIndexes.removeValue(forKey: id)
-                entries.removeValue(forKey: id)
-                timelines.removeValue(forKey: id)
-                sessionOptions.removeValue(forKey: id)
-            }
-            throw error
         }
+        else if try replica?.cursor(scope).epoch.isEmpty != false { throw ACPFailure(message: "此会话尚未缓存") }
+        try await sync(scope)
+        loaded.insert(session.id)
     }
 
-#if os(iOS)
-    // A session can be loadable before the server includes it in session/list.
     func restoreUnlistedSession(_ session: ACPSession, in project: ACPProject) async throws {
-        guard let connection = socket else { throw ACPFailure(message: "请先连接服务器") }
         try await load(session)
-        guard socket === connection, loaded.contains(session.id) else { throw ACPFailure(message: "未能恢复会话") }
         directory.insert(session, in: project, atFront: false)
     }
-#endif
 
     func close(_ id: String) async throws {
-        _ = try await call("session/close", ["sessionId": id])
+        let scope = "thread/" + id
         loaded.remove(id)
-        sessionOptions.removeValue(forKey: id)
-        permissions.removeAll { $0.sessionID == id }
+        pulling[scope]?.cancel()
+        hydrated.remove(scope)
+        resetProjection(scope)
+        if subscriptions.remove(scope) != nil, let broker { try await broker.subscribe("ev/" + scope, enabled: false) }
+    }
+
+    func toggleArchives() {
+        showingArchives.toggle()
+        for workspace in workspaceIDs { rebuildLists(workspace) }
+    }
+    func isArchived(_ id: String) -> Bool { threads[id]?["archived"] as? Bool == true }
+    func setArchived(_ archived: Bool, in id: String) async throws {
+        try await command("thread.archive", ["thread_id": id, "archived": archived], write: true, durable: true)
+        if let workspace = threads[id]?["workspace_id"] as? String { try await sync("threads/" + workspace) }
     }
 
     func deleteSession(_ id: String) async throws {
-        guard supportsSessionDelete else {
-            throw ACPFailure(message: "服务器不支持删除会话")
-        }
-        guard !prompting.contains(id) else {
-            throw ACPFailure(message: "请先停止当前回复")
-        }
-        guard let socket else { throw ACPFailure(message: "请先连接服务器") }
-
-        if loaded.contains(id), supportsSessionClose {
-            do {
-                try await close(id)
-            } catch let error as ACPFailure where error.code == -32002 {
-                guard self.socket === socket else { throw ACPFailure(message: "连接已断开") }
-                loaded.remove(id)
-                permissions.removeAll { $0.sessionID == id }
-            }
-        }
-        guard self.socket === socket else { throw ACPFailure(message: "连接已断开") }
-        do {
-            _ = try await call("session/delete", ["sessionId": id])
-        } catch let error as ACPFailure where error.code == -32002 {
-            // The server has already removed this session.
-        }
-        if let endpoint = socket.originalRequest?.url {
-            replyTimingStore.remove(endpoint: endpoint, sessionID: id)
-        }
-        guard self.socket === socket else { return }
-        loaded.remove(id)
-        sessionOptions.removeValue(forKey: id)
-        entries.removeValue(forKey: id)
-        timelines.removeValue(forKey: id)
-        transcriptIndexes.removeValue(forKey: id)
-        permissions.removeAll { $0.sessionID == id }
-        directory.remove(id)
-        if !listingProjects.isEmpty {
-            directoryRevision += 1
-            deletedDuringListing[id] = directoryRevision
-        }
-        titleUpdates.removeValue(forKey: id)
+        try await command("thread.delete", ["thread_id": id], write: true, durable: true)
+        purge(id)
     }
 
     func renameSession(_ session: ACPSession, to draft: String) async throws {
-        guard supportsSessionRename else { throw ACPFailure(message: "服务器不支持重命名会话") }
         let title = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty else { throw ACPFailure(message: "会话名称不能为空") }
-
-        do {
-            try await setSessionTitle(title, in: session.id)
-        } catch let error as ACPFailure where error.code == -32010 && !loaded.contains(session.id) {
-            try await load(session)
-            do {
-                try await setSessionTitle(title, in: session.id)
-            } catch {
-                if supportsSessionClose { try? await close(session.id) }
-                throw error
-            }
-            if supportsSessionClose {
-                do { try await close(session.id) }
-                catch { throw ACPFailure(message: "已重命名会话，但无法释放：\(error.localizedDescription)") }
-            }
-        }
-    }
-
-    private func setSessionTitle(_ title: String, in id: String) async throws {
-        guard let socket else { throw ACPFailure(message: "请先连接服务器") }
-        let startingRevision = directoryRevision
-        let result = try await call("session/set_title", ["sessionId": id, "title": title])
-        guard self.socket === socket else { throw ACPFailure(message: "连接已断开") }
-        if let update = titleUpdates[id], update.revision > startingRevision { return }
-        updateSessionTitle(result["title"] as? String ?? title, in: id)
-    }
-
-    private func updateSessionTitle(_ title: String, in id: String) {
-        directoryRevision += 1
-        titleUpdates[id] = (title, directoryRevision)
-        directory.updateTitle(title, for: id)
+        let row = try await command("thread.rename", ["thread_id": session.id, "title": title], write: true, durable: true)
+        directory.updateTitle(row["title"] as? String ?? title, for: session.id)
+        if let ws = threads[session.id]?["workspace_id"] as? String { try await sync("threads/" + ws) }
     }
 
     func setConfigOption(_ option: ACPConfigOption, value: String, in id: String) async throws {
-        try await setConfigOption(["sessionId": id, "configId": option.id, "value": value], in: id)
+        try await setConfig(option.id, value: value, in: id)
     }
-
     func setConfigOption(_ option: ACPConfigOption, enabled: Bool, in id: String) async throws {
-        try await setConfigOption([
-            "sessionId": id, "configId": option.id, "type": "boolean", "value": enabled
-        ], in: id)
+        try await setConfig(option.id, value: enabled, in: id)
     }
-
-    private func setConfigOption(_ params: [String: Any], in id: String) async throws {
-        guard loaded.contains(id) else { return }
-        let result = try await call("session/set_config_option", params)
-        guard let config = result["configOptions"] as? [[String: Any]] else {
-            throw ACPFailure(message: "Agent 未返回完整的会话设置")
-        }
-        if loaded.contains(id) {
-            sessionOptions[id, default: ACPSessionOptions()].config = ACPConfigOption.decode(config)
-        }
+    private func setConfig(_ config: String, value: Any, in id: String) async throws {
+        let result = try await command("thread.set_config", ["thread_id": id, "config_id": config, "value": value], write: true, durable: true)
+        applySessionSetup(result, to: id)
     }
-
-    func setMode(_ modeID: String, in id: String) async throws {
-        guard loaded.contains(id) else { return }
-        let previousMode = sessionOptions[id]?.currentModeID
-        _ = try await call("session/set_mode", ["sessionId": id, "modeId": modeID])
-        if loaded.contains(id), sessionOptions[id]?.currentModeID == previousMode {
-            sessionOptions[id]?.currentModeID = modeID
-        }
+    func setMode(_ mode: String, in id: String) async throws {
+        let result = try await command("thread.set_mode", ["thread_id": id, "mode_id": mode], write: true, durable: true)
+        sessionOptions[id, default: .init()].currentModeID = result["currentModeId"] as? String ?? mode
     }
-
     private func applySessionSetup(_ result: [String: Any], to id: String) {
         var options = sessionOptions[id, default: ACPSessionOptions()]
-        if options.config == nil, let config = result["configOptions"] as? [[String: Any]] {
-            options.config = ACPConfigOption.decode(config)
-        }
-        if let rawModes = result["modes"], let modes = decodeACP(ACPSessionModes.self, from: rawModes) {
+        if let config = result["configOptions"] as? [[String: Any]] { options.config = ACPConfigOption.decode(config) }
+        if let raw = result["modes"], let modes = decodeACP(ACPSessionModes.self, from: raw) {
             options.modes = modes
-            if options.currentModeID == nil { options.currentModeID = modes.currentModeId }
+            options.currentModeID = modes.currentModeId
         }
         sessionOptions[id] = options
     }
-
     func prompt(_ text: String, attachments: [ACPAttachment] = [], in id: String) async throws {
-        guard let socket, loaded.contains(id) else { throw ACPFailure(message: "请先打开会话") }
-        guard !prompting.contains(id) else { throw ACPFailure(message: "请等待当前回复完成") }
-        guard supportsPromptImages || !attachments.contains(where: { $0.preview.isImage }) else {
-            throw AttachmentError.unsupportedImage
-        }
-        guard supportsPromptFiles || attachments.allSatisfy({ $0.preview.isImage }) else {
-            throw AttachmentError.unsupportedFile
-        }
-        guard attachments.reduce(0, { $0 + $1.byteCount }) <= ACPAttachment.maxTotalBytes else {
-            throw AttachmentError.messageTooLarge
-        }
+        guard loaded.contains(id), !prompting.contains(id) else { throw ACPFailure(message: "会话尚未就绪") }
         var blocks: [[String: Any]] = text.isEmpty ? [] : [["type": "text", "text": text]]
         blocks += attachments.map(\.promptBlock)
-        guard !blocks.isEmpty else { return }
-        if !attachments.isEmpty, try JSONSerialization.data(withJSONObject: blocks).count > ACPAttachment.maxWireBytes {
-            throw AttachmentError.messageTooLarge
-        }
+        guard (1...32).contains(blocks.count) else { throw ACPFailure(message: "每条消息支持 1 至 32 项内容") }
         prompting.insert(id)
-        let startedAt = ContinuousClock.now
-        let userEntry = ACPEntry(kind: .user, text: text, attachments: attachments.map(\.preview))
-        updateTranscript(id) { history, _ in
-            history.append(userEntry)
-            return history.count - 1
-        }
-        defer { if self.socket === socket && !peerTurns.contains(id) { prompting.remove(id) } }
-        let result: [String: Any]
-        do {
-            result = try await call("session/prompt", ["sessionId": id, "prompt": blocks])
-        } catch {
-            if self.socket === socket,
-               entries[id]?.last?.id == userEntry.id || (error as? ACPFailure)?.code == -32010,
-               let offset = entries[id]?.firstIndex(where: { $0.id == userEntry.id }) {
-                entries[id]?.remove(at: offset)
-                timelines[id]?.replace(entries[id] ?? [])
-                // Removing an optimistic entry shifts indexes for later messages.
-                transcriptIndexes[id] = TranscriptIndex()
-                for (index, entry) in (entries[id] ?? []).enumerated() {
-                    if let key = entry.messageID { transcriptIndexes[id]?.messages[.init(kind: entry.kind, id: key)] = index }
-                    if let key = entry.toolID { transcriptIndexes[id]?.tools[key] = index }
-                }
-            }
-            throw error
-        }
-        guard self.socket === socket else { return }
-        let stopReason = result["stopReason"] as? String
-        if let stopReason, stopReason != "end_turn" {
-            updateTranscript(id) { history, _ in
-                history.append(ACPEntry(kind: .status, text: stopReason))
-                return history.count - 1
-            }
-        }
-        guard let history = entries[id], let promptIndex = history.lastIndex(where: { $0.id == userEntry.id }) else { return }
-        let timing = ACPReplyTiming(elapsed: startedAt.duration(to: .now),
-                                    wasStopped: stopReason == "cancelled" || stopReason == "canceled")
-        let response = history[(promptIndex + 1)...]
-        let anchor = response.lastIndex { $0.kind == .agent && $0.replyTimingID != nil }
-            ?? response.lastIndex { $0.replyTimingID != nil }
-        entries[id]?[anchor ?? promptIndex].replyTiming = timing
-        publishEntry(in: id, at: anchor ?? promptIndex)
-        if let anchor, let key = history[anchor].replyTimingID, let endpoint = socket.originalRequest?.url {
-            replyTimingStore.record(timing, for: key, endpoint: endpoint, sessionID: id)
-        }
+        if connected { sendStarted[id] = .now }
+        defer { if turns[id] == nil { prompting.remove(id) } }
+        let result = try await command("prompt.send", ["thread_id": id, "prompt": blocks], write: true, durable: true)
+        if result["queued"] as? Bool == true { sendStarted[id] = nil }
+        else { try await sync("thread/" + id) }
     }
-
     func cancelPrompt(in id: String) async throws {
-        guard let socket, prompting.contains(id) else { return }
-        try await send(["jsonrpc": "2.0", "method": "session/cancel", "params": ["sessionId": id]], to: socket)
-        for permission in permissions.filter({ $0.sessionID == id }) {
-            try await respond(to: permission, option: nil)
-        }
+        guard let turn = turns[id] else { return }
+        try await command("turn.cancel", ["thread_id": id, "turn_id": turn], write: true)
+        try await sync("thread/" + id)
     }
-
     func respond(to permission: ACPPermission, option: String?) async throws {
-        guard let socket, let index = permissions.firstIndex(where: { $0.id == permission.id }) else { return }
-        permissions.remove(at: index)
-        let outcome = option.map { ["outcome": "selected", "optionId": $0] } ?? ["outcome": "cancelled"]
-        do {
-            try await send(["jsonrpc": "2.0", "id": permission.requestID, "result": ["outcome": outcome]], to: socket)
-        } catch {
-            if self.socket === socket { disconnect(reason: error) }
-            throw error
-        }
-    }
-
-    private func call(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
-        guard let socket else { throw ACPFailure(message: "请先连接服务器") }
-        nextID += 1
-        let id = nextID
-        let message = try encode(["jsonrpc": "2.0", "id": id, "method": method, "params": params])
-        let timeout = Task {
-            guard method != "session/prompt" else { return }
-            do {
-                try await Task.sleep(for: .seconds(30))
-                if self.socket === socket, pending[id] != nil {
-                    disconnect(reason: ACPFailure(message: "\(method) 请求超时"))
-                }
-            } catch {}
-        }
-        defer { timeout.cancel() }
-        return try await withCheckedThrowingContinuation { continuation in
-            pending[id] = continuation
-            Task {
-                do {
-                    try await socket.send(.string(message))
-                } catch {
-                    if self.socket === socket { disconnect(reason: error) }
-                }
-            }
-        }
-    }
-
-    private func encode(_ message: [String: Any]) throws -> String {
-        String(decoding: try JSONSerialization.data(withJSONObject: message), as: UTF8.self)
-    }
-
-    private func send(_ message: [String: Any], to socket: URLSessionWebSocketTask) async throws {
-        try await socket.send(.string(encode(message)))
-    }
-
-    nonisolated private static func decodeFrame(_ text: String) throws -> sending [String: Any]? {
-        try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
-    }
-
-    @concurrent private static func decodeLargeFrame(_ text: String) async throws -> sending [String: Any]? {
-        try decodeFrame(text)
-    }
-
-    private func receive(from socket: URLSessionWebSocketTask) async {
-        var nextYield = ContinuousClock.now + .milliseconds(8)
-        do {
-            while self.socket === socket {
-                let frame = try await socket.receive()
-                guard self.socket === socket else { return }
-                guard case .string(let text) = frame else { continue }
-                let decoded: [String: Any]?
-                if text.utf8.count >= 32 * 1024 {
-                    decoded = try await Self.decodeLargeFrame(text)
-                    guard self.socket === socket else { return }
-                } else {
-                    decoded = try Self.decodeFrame(text)
-                }
-                guard let message = decoded, message["jsonrpc"] as? String == "2.0" else { continue }
-                if let method = message["method"] as? String {
-                    try await handle(method, message: message, socket: socket)
-                } else if let id = message["id"] as? Int, let continuation = pending.removeValue(forKey: id) {
-                    flushStream()
-                    if let error = message["error"] as? [String: Any] {
-                        let data = error["data"] as? [String: Any]
-                        continuation.resume(throwing: ACPFailure(
-                            message: error["message"] as? String ?? "服务器请求失败",
-                            code: error["code"] as? Int,
-                            reason: data?["reason"] as? String
-                        ))
-                    } else if let result = message["result"] {
-                        let payload = result as? [String: Any] ?? [:]
-                        if let meta = payload["_meta"] as? [String: Any],
-                           let session = meta["johnny/session_id"] as? String,
-                           meta["johnny/prompt_running"] as? Bool == true, replayHistory[session] != nil {
-                            prompting.insert(session)
-                        }
-                        continuation.resume(returning: payload)
-                    } else {
-                        continuation.resume(throwing: ACPFailure(message: "服务器响应缺少 result"))
-                    }
-                }
-                if ContinuousClock.now >= nextYield {
-                    await Task.yield()
-                    nextYield = ContinuousClock.now + .milliseconds(8)
-                }
-            }
-        } catch {
-            if self.socket === socket { disconnect(reason: error) }
-        }
-    }
-
-    private func handle(_ method: String, message: [String: Any], socket: URLSessionWebSocketTask) async throws {
-        let params = message["params"] as? [String: Any] ?? [:]
-        let sessionID = params["sessionId"] as? String
-        if method == "session/update", let sessionID, replayHistory[sessionID] == nil,
-           let update = params["update"] as? [String: Any],
-           let kind = update["sessionUpdate"] as? String,
-           kind == "agent_message_chunk" || kind == "agent_thought_chunk" {
-            enqueueStream(update, session: sessionID)
-            return
-        }
-        flushStream()
-        if let id = message["id"] {
-            if method == "session/request_permission", let sessionID,
-               let tool = params["toolCall"] as? [String: Any],
-               let options = params["options"] as? [[String: Any]] {
-                permissions.append(ACPPermission(
-                    requestID: id, sessionID: sessionID,
-                    title: tool["title"] as? String ?? "工具调用",
-                    details: tool["rawInput"].flatMap { input in
-                        guard let data = try? JSONSerialization.data(withJSONObject: input, options: [.fragmentsAllowed, .prettyPrinted, .sortedKeys]) else { return nil }
-                        return String(decoding: data, as: UTF8.self)
-                    },
-                    options: options.compactMap {
-                        guard let id = $0["optionId"] as? String, let name = $0["name"] as? String else { return nil }
-                        return ACPPermission.Option(id: id, name: name)
-                    }
-                ))
-            } else {
-                let code = method == "session/request_permission" ? -32602 : -32601
-                try await send(["jsonrpc": "2.0", "id": id, "error": [
-                    "code": code, "message": code == -32602 ? "Invalid params" : "Method not found"
-                ]], to: socket)
-            }
-        } else if method == "$/cancel_request", let request = params["requestId"] as? NSObject {
-            permissions.removeAll { request.isEqual($0.requestID) }
-        } else if method == "_johnny/prompt_started", let sessionID {
-            peerTurns.insert(sessionID)
-            prompting.insert(sessionID)
-        } else if method == "_johnny/prompt_finished", let sessionID {
-            peerTurns.remove(sessionID)
-            prompting.remove(sessionID)
-            permissions.removeAll { $0.sessionID == sessionID }
-            let reason = params["stopReason"] as? String
-            let detail = (params["error"] as? [String: Any])?["message"] as? String
-            if let status = detail ?? reason, status != "end_turn" {
-                updateTranscript(sessionID) { history, _ in
-                    history.append(ACPEntry(kind: .status, text: status))
-                    return history.count - 1
-                }
-            }
-        } else if method == "session/update", let sessionID, let update = params["update"] as? [String: Any] {
-            apply(update, to: sessionID)
-        }
+        let id = permission.sessionID
+        guard let option else { try await cancelPrompt(in: id); return }
+        guard let key = permission.requestID as? String, let turn = turns[id] else { return }
+        try await command("permission.answer", ["thread_id": id, "turn_id": turn, "permission_id": key, "option_id": option], write: true)
+        try await sync("thread/" + id)
     }
 
     private func updateTranscript(_ id: String, _ apply: (inout [ACPEntry], inout TranscriptIndex) -> Int?) {
-        if replayHistory[id] != nil {
-            _ = apply(&replayHistory[id, default: []], &transcriptIndexes[id, default: TranscriptIndex()])
-        } else if let offset = apply(&entries[id, default: []], &transcriptIndexes[id, default: TranscriptIndex()]) {
+        if let offset = apply(&entries[id, default: []], &transcriptIndexes[id, default: TranscriptIndex()]) {
             publishEntry(in: id, at: offset)
         }
     }
@@ -993,10 +849,6 @@ final class ACPClient {
         case "current_mode_update":
             guard let mode = update["currentModeId"] as? String else { return }
             sessionOptions[id, default: ACPSessionOptions()].currentModeID = mode
-        case "session_info_update":
-            if let title = update["title"] as? String {
-                updateSessionTitle(title, in: id)
-            }
         default:
             break
         }
