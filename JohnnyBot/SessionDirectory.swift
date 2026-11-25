@@ -26,7 +26,6 @@ final class ACPSession: Identifiable {
         switch agent {
         case "codex": base = "c.circle"
         case "antigravity": base = "a.circle"
-        case "pi": base = "p.circle"
         default: base = "bubble.left"
         }
         return loaded ? base + ".fill" : base

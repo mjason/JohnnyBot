@@ -429,14 +429,14 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
     var body: some View {
         workspaceContent
         .confirmationDialog(
-            "永久删除会话？",
+            sessionToDelete?.agent == "antigravity" ? "从 JohnnyBot 移除会话？" : "永久删除会话？",
             isPresented: Binding(get: { sessionToDelete != nil }, set: { if !$0 { sessionToDelete = nil } }),
             titleVisibility: .visible,
             presenting: sessionToDelete
         ) { session in
-            Button("永久删除会话", role: .destructive) {
+            Button(session.agent == "antigravity" ? "从 JohnnyBot 移除" : "永久删除会话", role: .destructive) {
                 manage {
-                    try await client.deleteSession(session.id)
+                    try await client.deleteSession(session)
                     workspace.drafts.removeValue(forKey: session.id)
                     workspace.draftAttachments.removeValue(forKey: session.id)
                     if workspace.selection == session.id {
@@ -446,7 +446,11 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
             }
             Button("取消", role: .cancel) {}
         } message: { session in
-            Text("「\(session.title)」的 Agent 会话和服务端历史会被永久删除，其他设备同步后也会移除。此操作无法撤销。")
+            if session.agent == "antigravity" {
+                Text("所有设备上的 JohnnyBot 会话记录都将移除。Antigravity 中保留原会话。")
+            } else {
+                Text("「\(session.title)」的 Agent 会话和服务端历史会被永久删除，其他设备同步后也会移除。此操作无法撤销。")
+            }
         }
         .alert("重命名会话", isPresented: Binding(
             get: { sessionToRename != nil },
@@ -1028,8 +1032,8 @@ private struct ServerWorkspace<Header: View, TrailingAction: View>: View {
                 if !archived && !client.showingArchives && workspace.selection == session.id { forgetSelection() }
             }
         })
-        items.append(SidebarMenuItem("删除会话", "trash", destructive: true,
-                                     disabled: !client.canDelete(session.id) || workspace.managing || client.prompting.contains(session.id)) {
+        items.append(SidebarMenuItem(session.agent == "antigravity" ? "从 JohnnyBot 移除" : "删除会话", "trash", destructive: true,
+                                     disabled: !client.canDelete(session) || workspace.managing || client.prompting.contains(session.id)) {
             sessionToDelete = session
         })
         return items

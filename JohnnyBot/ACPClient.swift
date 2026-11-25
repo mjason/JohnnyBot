@@ -148,7 +148,11 @@ final class ACPClient {
     var supportsConfig: Bool { connected && capabilities["thread_config"] == true }
     var supportsMode: Bool { connected && capabilities["thread_mode"] == true }
     var supportsSessionRename: Bool { connected }
-    func canDelete(_ id: String) -> Bool { connected && capabilities["thread_delete"] == true && deletionSupport[id] != false }
+    func canDelete(_ session: ACPSession) -> Bool {
+        guard connected else { return false }
+        if session.agent == "antigravity" { return capabilities["thread_forget_antigravity"] == true }
+        return capabilities["thread_delete"] == true && deletionSupport[session.id] != false
+    }
     var supportsPromptImages: Bool { available }
     var supportsPromptFiles: Bool { available }
     let directory = SessionDirectory()
@@ -263,7 +267,7 @@ final class ACPClient {
             }
             epoch = newEpoch
             workspaceIDs = ids
-            agents = info["agents"] as? [String] ?? ["codex"]
+            agents = (info["agents"] as? [String] ?? ["codex"]).filter { $0 != "pi" }
             capabilities = info["capabilities"] as? [String: Bool] ?? [:]
             if capabilities["quic_reads_v1"] == true {
                 reads = QuicReadClient(address: address, fingerprint: fingerprint, identity: device)
@@ -800,9 +804,10 @@ final class ACPClient {
         if let workspace = threads[id]?["workspace_id"] as? String { try await sync("threads/" + workspace) }
     }
 
-    func deleteSession(_ id: String) async throws {
-        try await command("thread.delete", ["thread_id": id], write: true, durable: true)
-        purge(id)
+    func deleteSession(_ session: ACPSession) async throws {
+        let operation = session.agent == "antigravity" ? "thread.forget" : "thread.delete"
+        try await command(operation, ["thread_id": session.id], write: true, durable: true)
+        purge(session.id)
     }
 
     func renameSession(_ session: ACPSession, to draft: String) async throws {
