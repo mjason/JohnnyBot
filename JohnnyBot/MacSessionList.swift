@@ -296,21 +296,21 @@ struct MacSessionList: View {
             cell.identifier = identifier
             if let folder = item as? Folder {
                 let project = folder.group.project
-                cell.bind { [weak self] cell in
-                    cell.display(project.name, icon: self?.model.activeProject() == project ? "folder.fill" : "folder")
+                cell.bind { [weak self] in
+                    .init(project.name, icon: self?.model.activeProject() == project ? "folder.fill" : "folder")
                 }
                 if folder.group.expanded { loadIfNeeded(project) }
             } else if let entry = item as? Entry {
                 let client = model.client, session = entry.session
-                cell.bind { cell in
+                cell.bind {
                     let approval = client.permissions.contains { $0.sessionID == session.id }
-                    cell.display(session.title, icon: client.loaded.contains(session.id) ? "bubble.left.fill" : "bubble.left",
+                    return .init(session.title, icon: client.loaded.contains(session.id) ? "bubble.left.fill" : "bubble.left",
                                  approval: approval, responding: client.prompting.contains(session.id))
                 }
             } else {
                 let title = item as? NSObject === section ? "项目" : (item as? NSObject === placeholder ?
                         (model.connected ? "添加项目后在此显示" : "连接服务器后显示项目") : "暂无会话")
-                cell.bind { cell in cell.display(title, secondary: true) }
+                cell.bind { .init(title, secondary: true) }
             }
             return cell
         }
@@ -370,7 +370,24 @@ struct MacSessionList: View {
         private let badge = NSImageView()
         private var spinner: NSProgressIndicator?
         private var version: UInt = 0
-        private var render: ((Cell) -> Void)?
+        struct Appearance: Equatable {
+            let title: String
+            var icon: String?
+            var secondary: Bool
+            var approval: Bool
+            var responding: Bool
+
+            init(_ title: String, icon: String? = nil, secondary: Bool = false,
+                 approval: Bool = false, responding: Bool = false) {
+                self.title = title
+                self.icon = icon
+                self.secondary = secondary
+                self.approval = approval
+                self.responding = responding
+            }
+        }
+        private var render: (() -> Appearance)?
+        private var applied: Appearance?
         private static let icons = ["folder", "folder.fill", "bubble.left", "bubble.left.fill", "lock.shield"]
             .reduce(into: [String: NSImage]()) { $0[$1] = NSImage(systemSymbolName: $1, accessibilityDescription: nil) }
 
@@ -386,22 +403,26 @@ struct MacSessionList: View {
         }
         required init?(coder: NSCoder) { nil }
 
-        func bind(_ render: @escaping (Cell) -> Void) {
+        func bind(_ render: @escaping () -> Appearance) {
             version &+= 1
             self.render = render
             observe()
         }
         private func observe() {
             let generation = version
-            withObservationTracking { render?(self) } onChange: { [weak self] in
+            let appearance = withObservationTracking { render?() } onChange: { [weak self] in
                 Task { @MainActor [weak self] in
                     guard let self, version == generation else { return }
                     observe()
                 }
             }
+            guard let appearance, appearance != applied else { return }
+            applied = appearance
+            display(appearance.title, icon: appearance.icon, secondary: appearance.secondary,
+                    approval: appearance.approval, responding: appearance.responding)
         }
-        override func prepareForReuse() { super.prepareForReuse(); version &+= 1; render = nil }
-        func display(_ title: String, icon: String? = nil, secondary: Bool = false, approval: Bool = false, responding: Bool = false) {
+        override func prepareForReuse() { super.prepareForReuse(); version &+= 1; render = nil; applied = nil }
+        private func display(_ title: String, icon: String? = nil, secondary: Bool = false, approval: Bool = false, responding: Bool = false) {
             label.stringValue = title
             label.font = secondary ? .preferredFont(forTextStyle: .subheadline) : .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
             label.textColor = secondary ? .secondaryLabelColor : .labelColor

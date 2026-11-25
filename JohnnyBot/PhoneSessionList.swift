@@ -210,6 +210,13 @@ struct PhoneSessionList: UIViewControllerRepresentable {
 
     private final class Cell: UITableViewCell {
         enum Accessory { case expanded, collapsed, session, responding, permission, empty }
+        private struct Appearance: Equatable {
+            let title: String
+            let symbol: String?
+            let accessory: Accessory
+            let textSize: UIContentSizeCategory
+        }
+        private var applied: Appearance?
         var render: ((Cell) -> Void)? { didSet { setNeedsUpdateProperties() } }
         private let indicator = UIActivityIndicatorView(style: .medium)
         private let glyph = UIImageView()
@@ -221,6 +228,11 @@ struct PhoneSessionList: UIViewControllerRepresentable {
         }
 
         func configure(title: String, symbol: String? = nil, accessory: Accessory) {
+            let appearance = Appearance(title: title, symbol: symbol, accessory: accessory,
+                                        textSize: traitCollection.preferredContentSizeCategory)
+            // UIKit can schedule updateProperties again after assigning a custom accessory.
+            guard applied != appearance else { return }
+            applied = appearance
             let folder = accessory == .expanded || accessory == .collapsed
             var content = defaultContentConfiguration()
             content.text = title
@@ -233,19 +245,21 @@ struct PhoneSessionList: UIViewControllerRepresentable {
             content.directionalLayoutMargins.top = 6
             content.directionalLayoutMargins.bottom = 6
             contentConfiguration = content
-            indicator.stopAnimating()
-            accessoryType = .none
-            accessoryView = nil
+            if accessory != .responding, indicator.isAnimating { indicator.stopAnimating() }
+            let type: UITableViewCell.AccessoryType = accessory == .session ? .disclosureIndicator : .none
+            if accessoryType != type { accessoryType = type }
             switch accessory {
-            case .session: accessoryType = .disclosureIndicator
-            case .responding: indicator.startAnimating(); accessoryView = indicator
+            case .session, .empty:
+                if accessoryView != nil { accessoryView = nil }
+            case .responding:
+                if !indicator.isAnimating { indicator.startAnimating() }
+                if accessoryView !== indicator { accessoryView = indicator }
             case .expanded, .collapsed, .permission:
                 let name = accessory == .permission ? "lock.shield" : accessory == .expanded ? "chevron.down" : "chevron.right"
                 glyph.image = UIImage(systemName: name, withConfiguration: UIImage.SymbolConfiguration(textStyle: .caption1))
                 glyph.tintColor = accessory == .permission ? .systemOrange : .secondaryLabel
                 glyph.sizeToFit()
-                accessoryView = glyph
-            case .empty: break
+                if accessoryView !== glyph { accessoryView = glyph }
             }
             accessibilityLabel = title
             accessibilityTraits = accessory == .empty ? .staticText : .button
